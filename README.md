@@ -101,6 +101,23 @@ on‑air by JS8Call through the audio bridge. See **Transmit** below.
 | SunSDR2 DX support | ⚠️ fully coded from ArtemisSDR, **untested on hardware** (`--variant DX`) |
 | CW transmit | ⛔ not built (encoder exists) |
 
+### Known gaps / TODO
+
+- **Audio output routing** — the mic *source* selector (`0x21`) is decoded, but
+  the radio's front‑panel audio *output* routing (e.g. Phones on the front) has
+  not been captured or identified. Needs an EESDR3 capture of the output‑routing
+  controls.
+- **GPSDO lock/sync status** — the external‑reference *select* bit (`0x1D`) is
+  decoded, but whether the radio reports 10 MHz *lock* isn't known. Capture the
+  radio with the reference present vs. absent and diff for a status bit/packet.
+- **Antenna port selection** — PRO opcode not yet identified (ArtemisSDR's `0x15`
+  mapping doesn't apply to the PRO).
+- **RX2 second receiver** — the enable field is known (STATE_SYNC byte 54), but
+  handling the second IQ stream isn't implemented.
+- **VHF** — largely untested; deliberately never keyed during TX calibration.
+- **SunSDR2 DX** — profile is coded from ArtemisSDR but unverified on hardware.
+- **CW transmit** — not built (the encoder exists).
+
 ---
 
 ## Quick start — receive
