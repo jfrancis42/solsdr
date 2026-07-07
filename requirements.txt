@@ -1,0 +1,12 @@
+# Core (required for RX + DSP + audio)
+numpy>=1.24
+scipy>=1.10
+sounddevice>=0.4.6
+
+# Tools (spectrum/waterfall PNG)
+matplotlib>=3.7
+
+# External (not pip): WSJT-X 'jt9' for FT8 self-validation (tools/validate_rx.sh)
+#   Debian/Ubuntu: apt install wsjtx      Arch: pacman -S wsjtx
+# External: an audio backend for sounddevice (PortAudio); on Linux use the
+#   PipeWire/PulseAudio device, not a raw ALSA hw: device.

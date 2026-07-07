@@ -1,0 +1,15 @@
+# Internal working files (utilities, session notes, dev scripts, bench-specific
+# calibration tooling) — not part of the public release.
+keep/
+
+# Packet captures (large, machine-specific)
+*.pcap
+*.pcapng
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.npy
