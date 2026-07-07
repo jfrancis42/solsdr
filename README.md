@@ -15,6 +15,15 @@ IQ. It's built for **experimentation**:
 - **Scripting / DSP** — a clean Python API (`Radio`, `Demodulator`, `Modulator`,
   `TXSession`) for building your own receivers, transmitters, and measurements.
 
+**A core design goal: solsdr has no GUI, by intent.** The entire SDR — every bit
+of its functionality — is a "front‑panel‑less" command‑line program, meant to be
+*remote‑controlled by other software* rather than operated by hand. There is no
+waterfall, no spectrum display, no knobs, dials, meters, or switches, and there
+never will be. Everything is driven over the network: Hamlib (`rigctld`),
+JS8Call, WSJT‑X, fldigi, GNU Radio, or your own scripts. If you want a
+point‑and‑click SDR console, this isn't it (use ExpertSDR3); solsdr is the
+headless engine that lets *other* tools use the radio without any of that.
+
 Author: **Jeff Francis, N0GQ**.
 
 > ### ⚠️ Alpha release
