@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Tests for the client-facing APIs: control_api (text protocol) and
-hamlib_compat (rigctld protocol).
+Tests for the client-facing text control API (control_api).
 
-Dispatch is tested directly (no sockets) for speed/determinism. A separate
-live test (test_hamlib_live.py) validates against the real `rigctl` binary
-when it is installed.
+Dispatch is tested directly (no sockets) for speed/determinism. Hamlib CAT is
+no longer a hand-rolled server — external software talks to a real rigctld that
+solsdr launches and mirrors to the radio (see solsdr/audio/rigctld_poller.py) —
+so there is no in-repo rigctld protocol to unit-test here.
 """
 import os
 import sys
@@ -13,7 +13,6 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from solsdr.api.control_api import ControlAPIServer
-from solsdr.api.hamlib_compat import HamlibServer
 
 
 class FakeRadio:
@@ -53,31 +52,6 @@ def test_control_api():
     print("PASS control_api dispatch")
 
 
-def test_hamlib_dispatch():
-    r = FakeRadio()
-    h = HamlibServer(r, verbose=False)
-    assert h.handle_command('F 7074000') == 'RPRT 0'
-    assert h.handle_command('f') == '7074000'
-    assert h.handle_command('F 21074000.000000') == 'RPRT 0'   # rigctl sends floats
-    assert h.handle_command('f') == '21074000'
-    assert h.handle_command('M USB 2400') == 'RPRT 0'
-    assert h.handle_command('m') == 'USB\n2400'
-    assert h.handle_command('M PKTUSB 3000') == 'RPRT 0'       # data -> USB
-    assert r.current_mode == 'USB'
-    assert h.handle_command('T 1') == 'RPRT 0'
-    assert h.handle_command('t') == '1'
-    assert h.handle_command('v') == 'VFOA'
-    assert h.handle_command('V VFOA') == 'RPRT 0'
-    assert h.handle_command('s') == '0\nVFOA'
-    assert h.handle_command('\\chk_vfo') == '0'
-    ds = h.handle_command('\\dump_state')
-    assert ds.endswith('RPRT 0')
-    assert 'done' in ds                                        # extended cap block
-    assert h.handle_command('q') is None
-    print("PASS hamlib dispatch")
-
-
 if __name__ == '__main__':
     test_control_api()
-    test_hamlib_dispatch()
     print("\nALL API TESTS PASSED")

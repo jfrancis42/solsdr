@@ -263,7 +263,11 @@ def main():
                      help='use the internal reference (default leaves it as-is; '
                           'the PRO boots with external reference enabled)')
     ap.add_argument('--hamlib', action='store_true',
-                    help='also run a Hamlib rigctld server on :4532')
+                    help='also run a real Hamlib rigctld (dummy backend) on :4532 '
+                         'and mirror its freq/mode to the radio (requires rigctld '
+                         'from Hamlib / libhamlib-utils)')
+    ap.add_argument('--hamlib-port', type=int, default=4532,
+                    help='port for the rigctld launched by --hamlib (default 4532)')
     ap.add_argument('--control-api', action='store_true',
                     help='also run the text control API on :5556')
     ap.add_argument('--iq-server', action='store_true',
@@ -283,10 +287,15 @@ def main():
 
     servers = []
     if args.hamlib:
-        from solsdr.api.hamlib_compat import HamlibServer
-        h = HamlibServer(_RadioControlAdapter(rx), port=4532)
+        # Launch a REAL rigctld (Hamlib dummy backend) and mirror its freq/mode
+        # to the radio. RX-only here, so PTT is a no-op. This is the same
+        # control model the JS8Call bridge uses — external software talks to
+        # genuine Hamlib, not a hand-rolled protocol server.
+        from solsdr.audio.rigctld_poller import RigctldPoller
+        h = RigctldPoller(_RadioControlAdapter(rx), ptt_callback=lambda on: None,
+                          port=args.hamlib_port)
         h.start(); servers.append(h)
-        print('hamlib rigctld server on :4532')
+        print(f'rigctld (real Hamlib, dummy backend) on :{args.hamlib_port}')
     if args.control_api:
         from solsdr.api.control_api import ControlAPIServer
         c = ControlAPIServer(_RadioControlAdapter(rx), port=5556)

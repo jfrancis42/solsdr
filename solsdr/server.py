@@ -5,7 +5,8 @@ solsdr-server — unified daemon.
 Ties the pieces together into one process:
     wake/discover -> control connection -> RX IQ stream
     + client-facing control API (TCP text, :5556)
-    + Hamlib rigctld-compatible server (:4532)
+    + a real Hamlib rigctld (dummy backend, :4532) whose freq/mode/PTT are
+      mirrored to the radio (control clients talk to genuine Hamlib)
 
 By default it runs against the MOCK radio so the full stack (both client APIs,
 IQ streaming, DSP) can be exercised on any machine with no hardware. Pass
@@ -28,7 +29,7 @@ import threading
 import time
 
 from .api.control_api import ControlAPIServer
-from .api.hamlib_compat import HamlibServer
+from .audio.rigctld_poller import RigctldPoller
 
 
 class _MockRadioAdapter:
@@ -69,13 +70,14 @@ def run_mock_stack(control_port, hamlib_port, tone):
     adapter = _MockRadioAdapter(mock)
 
     ctrl = ControlAPIServer(adapter, host='127.0.0.1', port=control_port)
-    ham = HamlibServer(adapter, host='127.0.0.1', port=hamlib_port)
+    ham = RigctldPoller(adapter, ptt_callback=adapter.set_ptt,
+                        host='127.0.0.1', port=hamlib_port)
     ctrl.start()
     ham.start()
 
     print("\nsolsdr-server (MOCK) running:")
     print(f"  control API : telnet 127.0.0.1 {control_port}  (try 'status')")
-    print(f"  hamlib      : rigctl -m 2 -r 127.0.0.1:{hamlib_port}")
+    print(f"  hamlib      : point clients at rigctl -m 2 -r 127.0.0.1:{hamlib_port}")
     print("  Ctrl-C to stop.\n")
 
     stop = threading.Event()
@@ -108,13 +110,14 @@ def run_real_stack(radio_ip, control_port, hamlib_port, wake, local_ip):
     radio.power_on()
 
     ctrl = ControlAPIServer(radio, host='127.0.0.1', port=control_port)
-    ham = HamlibServer(radio, host='127.0.0.1', port=hamlib_port)
+    ham = RigctldPoller(radio, ptt_callback=radio.set_ptt,
+                        host='127.0.0.1', port=hamlib_port)
     ctrl.start()
     ham.start()
 
     print("\nsolsdr-server running against real hardware:")
     print(f"  control API : 127.0.0.1:{control_port}")
-    print(f"  hamlib      : rigctl -m 2 -r 127.0.0.1:{hamlib_port}")
+    print(f"  hamlib      : point clients at rigctl -m 2 -r 127.0.0.1:{hamlib_port}")
     print("  Ctrl-C to stop.\n")
 
     stop = threading.Event()
