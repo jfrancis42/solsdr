@@ -17,17 +17,23 @@ little‑endian; "control packet" = 18‑byte header, opcode at byte 2.
 
 ---
 
-## 1. PRO IQ sample rate — the fix for issue #47
+## 1. PRO IQ sample rate — issues #46 / #47 (the missing capture)
 
-**Symptom in ArtemisSDR:** PRO stuck at 39062.5 Hz; the v2.1.7 attempt to lift it
-to 312500 (by changing the eight per‑channel rate‑code words from `0x14` to the
-DX's `0x32`) widened the spectrum but produced silent/garbled audio, so it was
-reverted.
+**Where ArtemisSDR is stuck (as of v2.1.7 / issue #47):** lifting the PRO from
+39062.5 Hz to a higher rate (issue #46) was attempted in v2.1.7 by swapping the
+eight per‑channel rate‑code words from `0x14` to the DX's `0x32`. On real PROs
+that broke RX — Bernie F6Bernie's #47 report ("no sound at all… panafall
+extremely slow… receiver seems completely deaf"), matching earlier reports from
+Jim W4JEA, Pedro EA5CCY, and SQ5OMO — so v2.1.7 was reverted. The hotfix notes
+state the blocker plainly: *"We don't have a verified wire capture of EESDR3
+commanding the PRO at 312500 to ground‑truth the correct rate code."*
 
-**Root cause:** those eight `0x14` rate‑code words are **not** the rate selector
-on the PRO — they stay constant across all rates. The actual selector is a
-**rate *index*** in the STATE_SYNC (`0x01`) packet at **byte offsets 56 and 58**
-(two `uint16` LE fields holding the same value):
+**Here is that capture / the ground truth.** The eight `0x14` rate‑code words are
+**not** the rate selector on the PRO — they stay constant across all four rates
+(so changing them to `0x32` is why RX broke: it corrupts the state‑sync template
+without actually selecting a rate). The real selector is a **rate *index*** in
+the STATE_SYNC (`0x01`) packet at **byte offsets 56 and 58** (two `uint16` LE
+fields carrying the same value):
 
 | index | rate |
 |-------|------|
@@ -36,15 +42,25 @@ on the PRO — they stay constant across all rates. The actual selector is a
 | 2 | 156250 Hz |
 | 3 | 312500 Hz |
 
-**How we verified:** captured ExpertSDR3 stepping 39→78→156→312→39 kHz; the index
-field cycled `0→1→2→3→0` while the `0x14` words never changed. Setting the index
-ourselves streams at exactly the commanded rate, and FT8 decodes cleanly at
-312500 Hz.
+**How this was verified:** captured ExpertSDR3 on a real PRO stepping the rate
+39→78→156→312→39 kHz; the index field at bytes 56/58 cycled `0→1→2→3→0` in exact
+lockstep while the eight `0x14` words never changed. Commanding the index
+directly (leaving the `0x14` words alone) streams at exactly the requested rate,
+and FT8 decodes cleanly at 312500 Hz on the PRO. So the DX‑vs‑PRO difference is
+**not** a different rate code in the same field — it's a different field
+entirely; the PRO uses this index while the `0x14` words are fixed formatting.
 
-**One downstream gotcha:** at the higher rates, a per‑block FFT `resample()` in
-the audio path smears tones at the large decimation ratio (~26:1 for 312.5 kHz →
-12 kHz) and silently kills FT8 decode. Use a polyphase `resample_poly` (or a
-staged decimator) with a proper anti‑alias FIR instead of FFT resample.
+**One downstream gotcha once the higher rate works:** at the higher rates, a
+per‑block FFT `resample()` in the audio path smears tones at the large decimation
+ratio (~26:1 for 312.5 kHz → 12 kHz) and silently kills FT8 decode even though
+the panadapter looks fine — which can masquerade as "rate set but no usable
+audio." Use a polyphase `resample_poly` (or a staged decimator) with a proper
+anti‑alias FIR instead of FFT resample.
+
+(Field offsets are into the STATE_SYNC payload as this project frames it; if the
+ArtemisSDR state‑sync template is indexed differently, the two `uint16` fields
+are the pair immediately after the RX‑count byte — see §4b, byte 54 — i.e. bytes
+54 = RX count, 56/58 = rate index.)
 
 ---
 
