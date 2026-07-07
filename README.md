@@ -100,7 +100,7 @@ on‑air by JS8Call through the audio bridge. See **Transmit** below.
 | USB / LSB / AM / FM / CW demodulation + S‑meter | ✅ verified |
 | CW receive: BFO demod + Morse decoder | ✅ verified (synthetic full‑chain) |
 | Automatic reconnection on network loss | ✅ verified (simulated interruption) |
-| Hamlib rigctld‑compatible control (via real Hamlib) | ✅ verified with JS8Call/WSJT‑X |
+| CAT control via real Hamlib `rigctld` (mirrored to the radio) | ✅ verified with JS8Call/WSJT‑X/`rigctl` |
 | Raw‑IQ TCP server + text control API (GNU Radio client) | ✅ verified |
 | Virtual‑audio bridge for JS8Call / WSJT‑X / fldigi | ✅ RX decoding + TX on‑air verified |
 | Stateful DSP filters (NR / NB / notch / APF / squelch) | ✅ unit‑tested |
@@ -153,15 +153,17 @@ q                  quit
 Expose the radio to other software:
 
 ```bash
-python3 solsdr_receiver.py 14074 --hamlib       # rigctld-compatible control on :4532
+python3 solsdr_receiver.py 14074 --hamlib       # CAT control via real rigctld on :4532
 python3 solsdr_receiver.py 14074 --iq-server    # raw complex64 IQ on tcp :5555
 python3 solsdr_receiver.py 14074 --rate 312500  # wider IQ (39062.5/78125/156250/312500)
 ```
 
 - **GNU Radio (IQ):** TCP Source (Complex Float 32) at `host:5555`; read the
   sample rate from the one‑line text header. See `clients/README.md`.
-- **WSJT‑X / fldigi (control only):** Radio = "Hamlib NET rigctl", server
-  `127.0.0.1:4532`.
+- **WSJT‑X / fldigi (control):** Radio = "Hamlib NET rigctl", server
+  `127.0.0.1:4532`. `--hamlib` requires **Hamlib's `rigctld`** to be installed —
+  solsdr does not implement the rigctld protocol itself, it launches a real one
+  and mirrors its state to the radio (see the CAT section below).
 
 `--device N` selects the audio output (list with
 `python3 -c "import sounddevice as sd; print(sd.query_devices())"`). On a
@@ -201,6 +203,47 @@ Run `python3 -m solsdr.audio --help` for all flags. Key ones: `--max-power-watts
 speaker so you can hear glitches). If the app can't open the device, quit it,
 start the bridge first, then relaunch the app so it binds to the current
 PulseAudio nodes.
+
+---
+
+## Radio control (CAT) — Hamlib `rigctld` is required
+
+solsdr does **not** implement the rigctld wire protocol itself. Control software
+(WSJT‑X, fldigi, JS8Call, Log4OM, `rigctl`, …) talks to a **real Hamlib
+`rigctld`**, and solsdr connects to that same rigctld as a second client,
+mirroring its frequency/mode/PTT to the radio over UDP. This means all the
+finicky CAT/PTT/split capability negotiation is Hamlib's own battle‑tested code,
+not a reimplementation — the tradeoff is that **`rigctld` must be installed**
+(Debian/Ubuntu: `libhamlib-utils`; Arch: `hamlib`).
+
+Both `solsdr_receiver.py --hamlib` and `python3 -m solsdr.audio` launch the
+rigctld for you (Hamlib dummy backend, model 1) on port 4532 and do the
+mirroring. You do not start rigctld yourself; you just point your software at it:
+
+```
+Your software (WSJT-X/fldigi/JS8Call/Log4OM/rigctl)
+        │  Hamlib NET rigctl  ->  127.0.0.1:4532
+        ▼
+   real rigctld (dummy backend)   ← launched by solsdr
+        ▲
+        │  solsdr polls freq/mode/PTT and mirrors to the radio (UDP)
+   SunSDR2 PRO
+```
+
+**Client configuration:**
+
+- **WSJT‑X / JS8Call / fldigi:** Rig = `Hamlib NET rigctl`, Network Server =
+  `127.0.0.1:4532`. For TX, set PTT method = `CAT`.
+- **`rigctl` (command line):** talk to the running rigctld as a NET client —
+  ```bash
+  rigctl -m 2 -r 127.0.0.1:4532        # -m 2 = "NET rigctl"
+  # then, at the prompt:  F 14074000   (set freq)   f  (get freq)
+  #                       M USB 3000   (set mode)   m  (get mode)
+  ```
+- **Any Hamlib app:** point its rigctld/NET‑rigctl host at `127.0.0.1:4532`.
+
+If you need rigctld on a different port, use `--hamlib-port N` (receiver) or
+`--hamlib-port N` (`solsdr.audio`).
 
 ---
 
@@ -297,7 +340,7 @@ solsdr/                   the Python package
   wake.py                 Broadcast discovery / wake
   tx.py                   Real-time audio->IQ->paced-UDP TX chain (no PTT)
   tx_session.py           Safety-interlocked TX orchestration (arm/key/drive/deadman)
-  server.py               Unified daemon (mock or real radio) + control/hamlib servers
+  server.py               Unified daemon (mock or real radio) + control API + rigctld mirror
   mock_radio.py           Behavioral radio emulator for offline testing
   protocol/
     profiles.py           Per-variant constants (PRO verified; DX from ArtemisSDR)
@@ -316,20 +359,21 @@ solsdr/                   the Python package
     tx_power.py           Per-band watts<->drive calibration table (TXPowerCal)
     tap_cal.py            RF-sample-tap loss calibration (TapCal), log-f interpolation
   api/
-    hamlib_compat.py      rigctld-compatible control server (used by server.py)
-    control_api.py        Text control API
+    control_api.py        Text control API (:5556)
     iq_server.py          Raw complex64 IQ TCP stream server (GNU Radio, etc.)
   audio/                  digital-mode bridge (python3 -m solsdr.audio)
     __main__.py           entry point: radio + real rigctld + virtual audio
     js8_bridge.py         RX demod -> virtual sink; app audio -> modulator -> TX
     pulse_devices.py      PulseAudio null sinks + monitor-source remap
-    rigctld_poller.py     launches real rigctld, mirrors freq/mode/PTT to the radio
+    rigctld_poller.py     launches real rigctld + mirrors freq/mode/PTT to the
+                          radio — the shared CAT mechanism used by the receiver,
+                          server, and audio bridge
 solsdr_receiver.py        Main receiver: live control shell + optional servers
 clients/                  example IQ client + GNU Radio notes
 tools/                    user utilities: FT8 self-test, IQ capture, spectrum,
                           TX power calibration (first-key, anchor, band sweep, tap)
 reference/cal/            EXAMPLE calibration data (author's bench — replace with yours)
-tests/                    12 test suites
+tests/                    11 test suites
 ```
 
 ---
@@ -338,7 +382,7 @@ tests/                    12 test suites
 
 ```bash
 # Offline suites (no radio needed); TX pacer/session skip without Linux timerfd
-for t in test_iq_decode test_codec test_apis test_mock test_hamlib_live \
+for t in test_iq_decode test_codec test_apis test_mock \
          test_iq_server test_tx_pacer test_modulator test_tx_session \
          test_cw test_filters test_js8_bridge; do
     python3 tests/$t.py

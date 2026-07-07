@@ -7,9 +7,10 @@ Wiring:
        (app reads <prefix>-rx.monitor / <prefix>-rx-mic)
   TX:  app writes <prefix>-tx  -> PulseAudioDevices.read_tx -> Modulator
        (inside TXSession) -> radio TX IQ
-  Control: the app talks Hamlib to the existing HamlibServer (freq/mode); PTT
-       (rigctl "T 1"/"T 0") is routed here via radio.set_ptt so the bridge can
-       key/unkey a TXSession around the app's transmit period.
+  Control: the app talks to a real rigctld (launched by RigctldPoller), which
+       mirrors freq/mode to the radio; a PTT edge from the poller is routed to
+       bridge.set_ptt so the bridge keys/unkeys a TXSession around the app's
+       transmit period.
 
 The app controls the radio entirely through Hamlib. This bridge only moves
 audio and reacts to PTT — it does not tune or set mode itself (it mirrors the
