@@ -69,11 +69,29 @@ def decode_iq_packet(packet: bytes, magic: int = MAGIC_PRO):
 
     Returns None if the packet is not a valid RX IQ frame. The returned
     samples are normalized to roughly [-1, 1) as I + jQ.
+
+    Single-receiver / back-compat helper: returns just the samples. Use
+    decode_iq_packet_rx() when RX2 may be active and you need the receiver index.
+    """
+    result = decode_iq_packet_rx(packet, magic)
+    return None if result is None else result[1]
+
+
+def decode_iq_packet_rx(packet: bytes, magic: int = MAGIC_PRO):
+    """
+    Decode a 1210-byte RX IQ packet, returning (rx_index, samples).
+
+    rx_index comes from RX IQ header byte 9: 0 = RX1, 1 = RX2 (verified on the
+    PRO — both receivers stream interleaved on the same port, tagged by byte 9;
+    byte 8 is the active-receiver count 1/2). Returns None if not a valid RX IQ
+    frame. Samples are complex64, I + jQ, normalized to ~[-1, 1).
     """
     if len(packet) != IQ_PKT_SIZE:
         return None
     if packet[0] != magic or packet[1] != 0xFF or packet[2] != OP_IQ_RX_IDLE:
         return None
+
+    rx_index = packet[9]  # 0 = RX1, 1 = RX2
 
     payload = np.frombuffer(packet, dtype=np.uint8, count=IQ_PAYLOAD_SIZE,
                             offset=IQ_HDR_SIZE)
@@ -85,7 +103,7 @@ def decode_iq_packet(packet: bytes, magic: int = MAGIC_PRO):
     out = np.empty(IQ_SAMPLES_PER_PKT, dtype=np.complex64)
     out.real = i
     out.imag = q
-    return out
+    return rx_index, out
 
 
 # --- TX encode -------------------------------------------------------------

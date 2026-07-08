@@ -93,6 +93,8 @@ on‑air by JS8Call through the audio bridge. See **Transmit** below.
 | Tuning, live retune (no restart) | ✅ verified |
 | RX IQ streaming @ 39062.5 Hz + bidirectional keepalive | ✅ verified |
 | Selectable IQ rate 39062.5 / 78125 / 156250 / 312500 Hz | ✅ verified (FT8 decoded at 312.5 kHz) |
+| **RX2 second receiver** (independent freq/mode; dual-watch) | ✅ verified — interleaved on one stream, per-receiver demod/IQ; `--rx2 <kHz>` |
+| RX1↔RX2 phase coherence (shared antenna) | ✅ measured **γ²≈0.999** — coherent dual-channel (DF/beamforming viable; see below) |
 | External 10 MHz reference (GPSDO) on/off | ✅ opcode verified (bytes identical to ExpertSDR3) |
 | Supply telemetry: voltage / current / temperature / forward‑power | ✅ `0x1F` fully decoded; shown in status (V/A, °F). Includes a forward‑power field (`fwd_power_raw`). No SWR is reported by the radio. Temperature is read‑only — the radio runs its own fan in firmware (no host setpoint) |
 | Front-end: HF.LPF, VHF.LNA toggles | ✅ opcodes verified (relay‑confirmed); `lpf`/`lna` shell cmds |
@@ -121,8 +123,6 @@ on‑air by JS8Call through the audio bridge. See **Transmit** below.
   radio with the reference present vs. absent and diff for a status bit/packet.
 - **Antenna port selection** — PRO opcode not yet identified (ArtemisSDR's `0x15`
   mapping doesn't apply to the PRO).
-- **RX2 second receiver** — the enable field is known (STATE_SYNC byte 54), but
-  handling the second IQ stream isn't implemented.
 - **VHF** — largely untested; deliberately never keyed during TX calibration.
 - **SunSDR2 DX** — profile is coded from ArtemisSDR but unverified on hardware.
 - **CW transmit** — not built (the encoder exists).
@@ -169,6 +169,31 @@ python3 solsdr_receiver.py 14074 --rate 312500  # wider IQ (39062.5/78125/156250
 `python3 -c "import sounddevice as sd; print(sd.query_devices())"`). On a
 PipeWire/PulseAudio desktop use the `pipewire`/`pulse` device, **not** a raw
 `hw:` ALSA device.
+
+### Second receiver (RX2 / dual-watch)
+
+The PRO's second receiver runs alongside the first with an independent frequency
+and mode — e.g. watch 20 m and 40 m at once:
+
+```bash
+python3 solsdr_receiver.py 14074 --rx2 7074 --iq-server
+#   RX1 -> audio + IQ on :5555   |   RX2 -> IQ on :5557
+#   --rx2-mode CW / --rx2-device N  set RX2's mode / audio output
+```
+
+Both receivers stream interleaved on one link (the radio tags each packet with
+its receiver index); solsdr routes them to independent demodulators and per-
+receiver IQ servers (RX1 :5555, RX2 :5557). In the interactive shell, prefix a
+command with `2 ` to target RX2 (e.g. `2 7074`, `2 m CW`); bare commands act on
+RX1. Both receivers share one sample rate (a hardware constraint).
+
+**Phase coherence:** fed from a single antenna, the two receivers are strongly
+phase-coherent — measured **γ² ≈ 0.999** at the signal (`tools/rx2_coherence.py`).
+That makes coherent dual-channel work (direction finding, beamforming, two-
+antenna noise cancelling) viable, with two caveats: the fixed phase offset is
+**not** repeatable across restarts (needs a per-session phase calibration), and
+real DF needs **two separate antennas** (the measured coherence is what makes the
+inter-antenna phase difference meaningful once you split the feed).
 
 ---
 
@@ -336,7 +361,8 @@ class‑AB HF final — wildly outside that means the power figure is wrong.
 ```
 solsdr/                   the Python package
   radio.py                High-level Radio: wake + power-on + tune + stream,
-                          bidirectional keepalive, auto-reconnect, front-end toggles
+                          bidirectional keepalive, auto-reconnect, front-end
+                          toggles, dual-receiver (RX2) routing
   wake.py                 Broadcast discovery / wake
   tx.py                   Real-time audio->IQ->paced-UDP TX chain (no PTT)
   tx_session.py           Safety-interlocked TX orchestration (arm/key/drive/deadman)

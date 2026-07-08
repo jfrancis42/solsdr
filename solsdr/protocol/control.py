@@ -63,6 +63,8 @@ class SolSDRControl:
         # RX2 (second receiver): STATE_SYNC byte 54 (0x02 on / 0x01 off).
         # Applied at power_on; flipping live requires a re-init.
         self.rx2_enabled = False
+        self.rx2_freq: Optional[int] = None
+        self.rx2_mode = 'USB'
 
     # -- raw send helpers --------------------------------------------------
     def _send_hex(self, hexstr: str, expect_response: bool = True) -> Optional[bytes]:
@@ -171,22 +173,32 @@ class SolSDRControl:
         except socket.timeout:
             return None
 
-    def set_frequency(self, freq_hz: int) -> bool:
-        """Tune RX1 to freq_hz. PRIMARY (0x09) then COMPANION (0x08)."""
+    def set_frequency(self, freq_hz: int, rx: int = 0) -> bool:
+        """Tune a receiver to freq_hz. PRIMARY (0x09) then COMPANION (0x08).
+
+        rx: receiver index — 0 = RX1 (default), 1 = RX2. Sent as the wire
+        sub-index (bytes 6-7). RX2 tuning only has effect when RX2 is enabled
+        (STATE_SYNC byte 54 = 0x02 at stream start)."""
         is_bcast_fm = 80_000_000 <= freq_hz <= 108_000_000
         offset = 0 if is_bcast_fm else self.DDC0_OFFSET_HZ
-        r1 = self._send_freq_pkt(OP_FREQ_PRIMARY, 0, freq_hz - offset)
-        r2 = self._send_freq_pkt(OP_FREQ_COMP, 0, freq_hz)
+        r1 = self._send_freq_pkt(OP_FREQ_PRIMARY, rx, freq_hz - offset)
+        r2 = self._send_freq_pkt(OP_FREQ_COMP, rx, freq_hz)
         if r1 is not None or r2 is not None:
-            self.current_freq = freq_hz
+            if rx == 0:
+                self.current_freq = freq_hz
+            else:
+                self.rx2_freq = freq_hz
             return True
         return False
 
-    def set_mode(self, mode: str) -> bool:
-        """Record the demod mode. Mode is applied client-side in the DSP; the
-        radio streams wideband IQ regardless. Kept for API symmetry so the
-        control/Hamlib layers can report and set mode."""
-        self.current_mode = mode.upper()
+    def set_mode(self, mode: str, rx: int = 0) -> bool:
+        """Record the demod mode for a receiver (0=RX1, 1=RX2). Mode is applied
+        client-side in the DSP; the radio streams wideband IQ regardless. Kept
+        for API symmetry so the control/Hamlib layers can report and set mode."""
+        if rx == 0:
+            self.current_mode = mode.upper()
+        else:
+            self.rx2_mode = mode.upper()
         return True
 
     # -- TX control primitives --------------------------------------------
