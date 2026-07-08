@@ -34,6 +34,10 @@ class RadioProfile:
     # RX packet to stay alive (verified True on PRO).
     rx_needs_tx_keepalive: bool = True
     verified: bool = False
+    # RX frequency coverage (Hz), inclusive, for input validation. Nominal from
+    # the published spec; the PRO covers ~0.1-65 MHz plus the 2 m segment.
+    freq_min_hz: int = 100_000
+    freq_max_hz: int = 65_000_000
 
 
 # --- Verified init sequence for the PRO (from expert_14074.pcapng) ----------

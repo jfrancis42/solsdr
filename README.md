@@ -104,6 +104,7 @@ on‑air by JS8Call through the audio bridge. See **Transmit** below.
 | Automatic reconnection on network loss | ✅ verified (simulated interruption) |
 | CAT control via real Hamlib `rigctld` (mirrored to the radio) | ✅ verified with JS8Call/WSJT‑X/`rigctl` |
 | Raw‑IQ TCP server + text control API (GNU Radio client) | ✅ verified |
+| **Raw‑IQ TX server** (GNU Radio → radio; complex64 in, transmitted verbatim) | ✅ **hardware‑verified** (2026‑07‑08, RF into dummy load) — `--iq-tx-server` (:5558); disarmed by default, `--tx-arm` to key |
 | Virtual‑audio bridge for JS8Call / WSJT‑X / fldigi | ✅ RX decoding + TX on‑air verified |
 | Stateful DSP filters (NR / NB / notch / APF / squelch) | ✅ unit‑tested |
 | Transmit chain (SSB/AM/FM modulate, pacing, PTT/drive/PA) | ✅ on‑air verified into dummy load |
@@ -123,52 +124,251 @@ on‑air by JS8Call through the audio bridge. See **Transmit** below.
   radio with the reference present vs. absent and diff for a status bit/packet.
 - **Antenna port selection** — PRO opcode not yet identified (ArtemisSDR's `0x15`
   mapping doesn't apply to the PRO).
+- **TX frequency coverage** — RESOLVED (2026‑07‑08): the PRO **transmits out of
+  band**. Keyed at 13000 kHz (non‑ham) into a dummy load, it made RF with no
+  firmware band lock and no tune refusal. Note off‑band forward power reads lower
+  for the same DC draw (no band‑specific output match), and no band there is
+  calibrated — so use raw drive, not a watts setpoint, off the ham bands. TX
+  responsibly and legally.
 - **VHF** — largely untested; deliberately never keyed during TX calibration.
 - **SunSDR2 DX** — profile is coded from ArtemisSDR but unverified on hardware.
 - **CW transmit** — not built (the encoder exists).
 
 ---
 
+## Install
+
+```bash
+# Option A — install the package (gives you the `solsdr` command):
+pip install .                          # from a clone; or:  pip install solsdr
+
+# Option B — run from a source checkout without installing:
+pip install -r requirements.txt        # numpy, scipy, sounddevice
+```
+
+`rigctld` (from `hamlib` / `libhamlib-utils`) is required for CAT control and
+the digital-mode bridge. For an always-on headless setup, see
+[`systemd/README.md`](systemd/README.md).
+
 ## Quick start — receive
 
 ```bash
-pip install -r requirements.txt        # numpy, scipy, sounddevice
-
-# Receive 20 m FT8 with live audio; type commands at the sdr> prompt
-python3 solsdr_receiver.py 14074 --device 5
+# Receive 20 m FT8 with live audio; type commands at the sdr> prompt.
+solsdr 14074 --device 5                # if installed
+python3 solsdr_receiver.py 14074 --device 5   # from a source checkout
 ```
-
-Interactive commands while running:
-
-```
-<kHz>              tune (e.g. 7074)              nr <0-1>    noise reduction
-m <mode>           USB/LSB/AM/FM/CW/CWU/CWL      nb <0-1>    noise blanker
-cw on|off          live Morse decode            notch <Hz>  notch filter (0=off)
-s                  S-meter + status             apf <0-1>   audio peak filter (CW)
-ref ext|int        10 MHz reference             sql <0-1>   squelch
-lpf on|off         HF low-pass filter           mic <src>   mic source
-q                  quit
-```
-
-Expose the radio to other software:
-
-```bash
-python3 solsdr_receiver.py 14074 --hamlib       # CAT control via real rigctld on :4532
-python3 solsdr_receiver.py 14074 --iq-server    # raw complex64 IQ on tcp :5555
-python3 solsdr_receiver.py 14074 --rate 312500  # wider IQ (39062.5/78125/156250/312500)
-```
-
-- **GNU Radio (IQ):** TCP Source (Complex Float 32) at `host:5555`; read the
-  sample rate from the one‑line text header. See `clients/README.md`.
-- **WSJT‑X / fldigi (control):** Radio = "Hamlib NET rigctl", server
-  `127.0.0.1:4532`. `--hamlib` requires **Hamlib's `rigctld`** to be installed —
-  solsdr does not implement the rigctld protocol itself, it launches a real one
-  and mirrors its state to the radio (see the CAT section below).
 
 `--device N` selects the audio output (list with
 `python3 -c "import sounddevice as sd; print(sd.query_devices())"`). On a
 PipeWire/PulseAudio desktop use the `pipewire`/`pulse` device, **not** a raw
 `hw:` ALSA device.
+
+---
+
+## Configuration file
+
+Rather than retype `--radio-ip`, `--local-ip`, `--device`, etc. on every run,
+put station defaults in `~/.config/solsdr/config.*` (searched in this order:
+`config.json`, `config.conf`, `config.ini`, `config.cfg`). Keys mirror the CLI
+flag names (argparse `dest`), so `--local-ip` → `local_ip`, `--radio-ip` →
+`radio_ip`, and so on. **Precedence: CLI flag > config file > built‑in default**,
+so a flag always wins over the file.
+
+Flat `key = value` format (`config.conf`) — values are auto‑typed (int/float/
+bool); `#` starts a comment:
+
+```ini
+# ~/.config/solsdr/config.conf
+radio_ip  = 10.1.2.3
+local_ip  = 10.1.2.185
+device    = 5
+variant   = PRO
+freq_khz  = 14074
+mode      = USB
+rate      = 39062.5
+ext_ref   = true
+log_level = info
+```
+
+Or JSON (`config.json`) if you prefer:
+
+```json
+{
+  "radio_ip": "10.1.2.3",
+  "local_ip": "10.1.2.185",
+  "device": 5,
+  "freq_khz": 14074,
+  "mode": "USB",
+  "ext_ref": true
+}
+```
+
+With that in place, `solsdr` (no args) tunes 20 m USB on the right radio; add a
+frequency to override just that: `solsdr 7074`. Point at a different file with
+`--config /etc/solsdr/config.conf` (handy for the systemd service). Unknown keys
+are ignored with a warning, so a shared config can carry extra keys.
+
+---
+
+## Interactive shell — commands with examples
+
+While the receiver runs, type at the `sdr>` prompt. Bare commands act on RX1;
+prefix with `2 ` to target the second receiver (see [RX2](#second-receiver-rx2--dual-watch)).
+
+| Command | Example | Effect |
+|---|---|---|
+| `<kHz>` | `7074` | Tune to 7074 kHz |
+| `m <mode>` | `m CW` | Set mode: USB / LSB / AM / FM / CW / CWU / CWL |
+| `cw on\|off` | `cw on` | Toggle the live Morse decoder |
+| `s` | `s` | Print S‑meter + full status line |
+| `ref ext\|int` | `ref ext` | External 10 MHz (GPSDO) vs internal reference |
+| `lpf on\|off` | `lpf on` | HF low‑pass filter relay |
+| `lna on\|off` | `lna on` | VHF LNA |
+| `preamp <state>` | `preamp -10` | RX preamp/att: `-20` `-10` `0` `+10` dB, or `off`/`preamp` |
+| `mic <src>` | `mic pc` | Mic source: `mic1` / `mic2` / `pc` |
+| `rit <Hz>` | `rit 250` | Receiver incremental tuning (`rit 0` = off) |
+| `nr <0-1>` | `nr 0.4` | Noise reduction strength |
+| `nb <0-1>` | `nb 0.3` | Noise blanker |
+| `notch <Hz>` | `notch 800` | Manual notch (`notch 0` = off) |
+| `apf <0-1>` | `apf 0.6` | Audio peak filter (CW) |
+| `sql <0-1>` | `sql 0.2` | Squelch threshold |
+| `2 <cmd>` | `2 m CW` | Run any of the above against RX2 (e.g. `2 7074`) |
+| `q` | `q` | Quit |
+
+---
+
+## CLI flags — common use cases
+
+```bash
+# Plain listening: 40 m LSB, audio out on device 5
+solsdr 7185 --mode LSB --device 5
+
+# Point at a specific radio / interface (overrides the config file)
+solsdr 14074 --radio-ip 10.1.2.3 --local-ip 10.1.2.185
+
+# Expose CAT to WSJT-X / fldigi / JS8Call (real rigctld on :4532)
+solsdr 14074 --hamlib
+
+# Stream raw IQ to GNU Radio (complex64 on tcp :5555)
+solsdr 14074 --iq-server
+
+# Accept raw IQ from GNU Radio and TRANSMIT it (tcp :5558). No RF without --tx-arm.
+solsdr 14074 --iq-tx-server                        # wiring test, no RF
+solsdr 14074 --iq-tx-server --tx-arm --max-power-watts 5 --tx-watts 3
+
+# Everything at once: CAT + IQ + text control API, wider 312.5 kHz IQ
+solsdr 14074 --hamlib --iq-server --control-api --rate 312500
+
+# Dual-watch: RX1 20 m (audio + IQ :5555), RX2 40 m CW (IQ :5557)
+solsdr 14074 --rx2 7025 --rx2-mode CW --iq-server
+
+# External 10 MHz reference (GPSDO) on / off
+solsdr 14074 --ext-ref
+solsdr 14074 --no-ext-ref
+
+# Headless for a fixed time then exit (no prompt) — scripting/capture
+solsdr 14074 --iq-server --seconds 60
+
+# Move the CAT or IQ ports
+solsdr 14074 --hamlib --hamlib-port 4540 --iq-server --iq-port 5560
+
+# SunSDR2 DX (UNVERIFIED profile) and quieter logging
+solsdr 14074 --variant DX --log-level warning
+
+# Show version
+solsdr --version
+```
+
+`--iq-port` sets RX1's IQ port; RX2's is always RX1+2 (default 5557). Full list:
+`solsdr --help`.
+
+---
+
+## GNU Radio — IQ in and out
+
+solsdr exposes the radio to GNU Radio (or any SDR tooling) two ways: **raw IQ
+over TCP** for receive, and **audio into the digital‑mode bridge** for transmit.
+
+### Receiving IQ (radio → GNU Radio)
+
+Start the IQ server and connect a **TCP source**:
+
+```bash
+solsdr 14074 --iq-server --rate 312500        # complex64 IQ on tcp 0.0.0.0:5555
+```
+
+On the first connect, solsdr sends one newline‑terminated text header, then a
+continuous stream of interleaved little‑endian `float32` I/Q (i.e. GNU Radio
+`complex float 32`):
+
+```
+SOLSDR IQ rate=312500.0 fmt=complex64 freq=14074000\n<raw complex64 samples…>
+```
+
+In GNU Radio Companion:
+
+1. **Socket PDU** or **TCP Source** — use a *TCP Client* **Socket PDU**, or the
+   `blocks.socket_pdu`/a TCP source block, pointed at `<host>:5555`,
+   Type = **Complex Float 32**.
+2. Set the flowgraph **sample rate** to match `--rate` (39062.5 / 78125 / 156250
+   / 312500). solsdr announces it in the header line; read it once and hardcode
+   the variable, or strip the header in a small Python block.
+3. The IQ is baseband, centered on the tuned frequency; set your **QT GUI Sink**
+   center frequency to the tuned freq so the axis reads in absolute Hz. A ready
+   combined FFT+waterfall flowgraph is in
+   [`clients/gnuradio/qt_iq_waterfall.py`](clients/gnuradio); see
+   [`clients/README.md`](clients/README.md).
+
+The header ends at the first `\n`; a client that doesn't care can skip those
+bytes and treat the rest as pure `complex64`. RX2, if enabled, is a second
+identical stream on **:5557**, so a flowgraph can pull both receivers for
+coherent two‑channel work (see [phase coherence](#second-receiver-rx2--dual-watch)).
+
+### Transmitting IQ from GNU Radio (GNU Radio → radio)
+
+The **raw‑IQ TX server** is the transmit counterpart of `--iq-server`: it accepts
+raw `complex64` baseband IQ over TCP and streams it to the radio verbatim (gain +
+clip only — no modulation, no resampling), so your flowgraph *is* the modulator.
+
+```bash
+# Raw-IQ TX. Off (no RF) unless you add --tx-arm. Always into a dummy load first.
+solsdr 14074 --iq-tx-server                       # wiring test: runs, no RF
+solsdr 14074 --iq-tx-server --tx-arm \
+       --max-power-watts 5 --tx-watts 3           # ARMED: keys on connect
+```
+
+Then in GNU Radio Companion, end your TX chain in a **TCP Sink** (or
+`blocks.socket_pdu` as a TCP client), Type = **Complex Float 32**, pointed at
+`<host>:5558`:
+
+1. Produce **baseband IQ at the radio wire rate** (39062.5 Hz by default — match
+   `--rate`). There is no resampler on this path, so a rate mismatch transmits at
+   the wrong speed; the server announces the required rate in its
+   `SOLSDR IQTX rate=… fmt=complex64` header. Keep samples in `[-1, 1]`
+   (the server clips at ~0.98 to protect the 24‑bit packing).
+2. **The radio keys automatically while a client is connected** and unkeys on
+   disconnect (or after an idle gap). Only one transmitter at a time. No separate
+   PTT step is needed — connecting *is* keying.
+
+So a full baseband‑to‑RF SSB/data waveform you build in GNU Radio goes straight
+out the antenna, and RX (`--iq-server`, :5555) + TX (`--iq-tx-server`, :5558) give
+you a symmetric complex‑IQ pipe in and out of the radio.
+
+**Alternative — audio bridge:** for JS8Call/WSJT‑X/fldigi (or any app that emits
+*audio*, not IQ), use the bridge instead, which runs the audio through solsdr's
+own SSB/AM/FM modulator and keys via CAT:
+
+```bash
+python3 -m solsdr.audio --radio 10.1.2.3 --local-ip 10.1.2.185 \
+    --freq 14074000 --tx-mode USB --max-power-watts 5 --tx-watts 3
+# app TX audio -> solsdr-tx sink -> modulator -> radio;  PTT = CAT
+```
+
+⚠️ Both TX paths obey the same safety interlocks (arming, amp‑protection watt
+ceiling, calibration gating, dead‑man). The raw‑IQ server is **disarmed by
+default** — it runs the whole chain with no RF until you pass `--tx-arm`.
+**Always key into a dummy load first.** For pure IQ *analysis* GNU Radio only
+needs the RX path above.
 
 ### Second receiver (RX2 / dual-watch)
 
@@ -186,6 +386,13 @@ its receiver index); solsdr routes them to independent demodulators and per-
 receiver IQ servers (RX1 :5555, RX2 :5557). In the interactive shell, prefix a
 command with `2 ` to target RX2 (e.g. `2 7074`, `2 m CW`); bare commands act on
 RX1. Both receivers share one sample rate (a hardware constraint).
+
+**RX2 is for dual-*watch*, not receive-through-transmit.** Verified 2026-07-08:
+while RX1 is keyed, **neither** receiver streams — the single UDP link on port
+50002 carries the `0xFD` TX frames in place of RX IQ, so both RX1 and RX2 packet
+rates drop to under 1 % of normal for the key-down and resume the instant you
+unkey. Fine for monitoring two frequencies between overs; not a way to hear RX2
+*during* a transmission.
 
 **Phase coherence:** fed from a single antenna, the two receivers are strongly
 phase-coherent — measured **γ² ≈ 0.999** at the signal (`tools/rx2_coherence.py`).
@@ -386,7 +593,9 @@ solsdr/                   the Python package
     tap_cal.py            RF-sample-tap loss calibration (TapCal), log-f interpolation
   api/
     control_api.py        Text control API (:5556)
-    iq_server.py          Raw complex64 IQ TCP stream server (GNU Radio, etc.)
+    iq_server.py          Raw complex64 IQ TCP stream server, RX (GNU Radio, etc.)
+    iq_tx_server.py       Raw complex64 IQ TCP server, TX — client IQ -> radio,
+                          interlocked (disarmed unless --tx-arm)
   audio/                  digital-mode bridge (python3 -m solsdr.audio)
     __main__.py           entry point: radio + real rigctld + virtual audio
     js8_bridge.py         RX demod -> virtual sink; app audio -> modulator -> TX
@@ -399,7 +608,7 @@ clients/                  example IQ client + GNU Radio notes
 tools/                    user utilities: FT8 self-test, IQ capture, spectrum,
                           TX power calibration (first-key, anchor, band sweep, tap)
 reference/cal/            EXAMPLE calibration data (author's bench — replace with yours)
-tests/                    11 test suites
+tests/                    12 test suites
 ```
 
 ---
@@ -409,8 +618,8 @@ tests/                    11 test suites
 ```bash
 # Offline suites (no radio needed); TX pacer/session skip without Linux timerfd
 for t in test_iq_decode test_codec test_apis test_mock \
-         test_iq_server test_tx_pacer test_modulator test_tx_session \
-         test_cw test_filters test_js8_bridge; do
+         test_iq_server test_iq_tx_server test_tx_pacer test_modulator \
+         test_tx_session test_cw test_filters test_js8_bridge; do
     python3 tests/$t.py
 done
 ```

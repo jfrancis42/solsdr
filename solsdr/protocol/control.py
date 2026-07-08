@@ -59,6 +59,7 @@ class SolSDRControl:
         # Front-end switches
         self.hf_lpf = False
         self.vhf_lna = False
+        self.preamp_state = 0x82  # 0 dB / bypass (0x80-0x83; shares 0x05 w/ LNA)
         self.mic_source = 0  # 0=Mic1, 1=Mic2, 2=PC
         # RX2 (second receiver): STATE_SYNC byte 54 (0x02 on / 0x01 off).
         # Applied at power_on; flipping live requires a re-init.
@@ -282,6 +283,38 @@ class SolSDRControl:
         self.vhf_lna = bool(on)
         return r is not None
 
+    # Preamp/attenuator states (0x05 byte18). From the ArtemisSDR reference /
+    # opcodes.py: 0x80=-20 dB, 0x81=-10 dB, 0x82=0 dB (bypass), 0x83=+10 dB
+    # preamp. NOTE: 0x82 (0 dB) is the same value the VHF.LNA-off sends — on the
+    # PRO the 0x05 opcode is shared. The 0 dB / +10 dB pair (0x82/0x83) is the
+    # HF-relevant preamp on/off; -10/-20 (0x81/0x80) are attenuation. These dB
+    # LABELS come from the reference and are NOT independently wattmeter/
+    # signal-verified on the PRO — treat the dB values as nominal until checked.
+    PREAMP_STATES = {'-20': 0x80, '-10': 0x81, '0': 0x82, '+10': 0x83,
+                     'att20': 0x80, 'att10': 0x81, 'off': 0x82, 'preamp': 0x83,
+                     'on': 0x83}
+
+    def set_preamp(self, state) -> bool:
+        """RX preamp / attenuator via 0x05. Accepts a dB string ('-20','-10',
+        '0','+10'), a friendly alias ('att20','att10','off','preamp'/'on'), or a
+        raw byte 0x80-0x83. Returns True on ack.
+
+        Caveat: the dB values are the reference's nominal labels, not verified on
+        PRO hardware. And 0x05 is shared with VHF.LNA — setting the preamp here
+        will also move the LNA state, since they're the same register."""
+        if isinstance(state, str):
+            val = self.PREAMP_STATES.get(state.lower().strip())
+            if val is None:
+                raise ValueError(f'preamp must be one of {list(self.PREAMP_STATES)} '
+                                 f'or a raw byte 0x80-0x83')
+        else:
+            val = int(state)
+            if val not in (0x80, 0x81, 0x82, 0x83):
+                raise ValueError('raw preamp byte must be 0x80-0x83')
+        r = self._send_u32(OP_PREAMP_ATT, val)
+        self.preamp_state = val
+        return r is not None
+
     # Mic source values (0x21 byte18), ALL verified against ExpertSDR3 on the
     # PRO 2026-07-07. The radio only has TWO values: 0=Mic1, 1=Mic2. The GUI's
     # "PC" option sends the SAME 0x21=1 as Mic2 (Mic2 and PC are indistinguishable
@@ -319,6 +352,16 @@ class SolSDRControl:
         b = bytearray.fromhex(pkt)
         b[0] = self.magic
         return self._send_hex(b.hex()) is not None
+
+    def power_off(self) -> bool:
+        """Send POWER_OFF (0x02) so the radio is left in a defined state rather
+        than having the stream abandoned. Best-effort; returns True on ack."""
+        try:
+            r = self._send_cmd(OP_POWER_OFF, b'', expect_response=True)
+        except OSError:
+            return False
+        self.powered_on = False
+        return r is not None
 
     def close(self):
         self.sock.close()

@@ -278,6 +278,20 @@ upstream TX implementation:
 - **RX2 second receiver — done.** Enable, per‑receiver tuning, IQ‑stream
   demux (header byte 9), keepalive, and phase coherence are all worked out and
   implemented; see §4b.
+- **RX during TX — neither receiver streams while keyed (2026‑07‑08).** Bench
+  test into a dummy load with RX1 (20 m) + RX2 (40 m) both active: keying RX1
+  dropped BOTH receivers' packet rate from ~195 pkt/s each to ~1 pkt/s for the
+  key‑down, resuming instantly on unkey. This follows directly from §5 — the
+  `0xFD` TX IQ frames *replace* the RX IQ on the shared port 50002, so the radio
+  is either streaming RX or accepting TX, not both. There is no receive‑through‑
+  transmit on the PRO; RX2 is for dual‑*watch* between overs.
+- **TX is general‑coverage — NOT ham‑band‑locked (2026‑07‑08).** Keyed at
+  13000 kHz (non‑ham) into a dummy load with raw drive: the radio tuned without
+  refusal and made RF (forward‑power telemetry rose, DC current 1.1→2.6 A). No
+  firmware band restriction on TX. Two notes: off‑band forward power reads lower
+  for the same DC draw (no band‑specific output match), and the tune/key path
+  reported no error off‑band — so an application, not the radio, must enforce any
+  band‑edge policy.
 - **Fan / temperature — nothing to send.** The radio regulates its fan
   autonomously in firmware. The fan cycles on its own while solsdr runs (solsdr
   sends no fan/temp command), and a 2026‑07‑08 control‑socket capture while
@@ -292,10 +306,6 @@ upstream TX implementation:
   capture showed `0x15` staying `00` while `0x1e`/`0x20` moved, so the PRO
   mapping differs. Needs a clean one‑selector‑at‑a‑time recapture — not pursued
   further yet.
-- **TX behavior with RX2 enabled.** Does either receiver keep streaming through
-  a key‑down (single transmitter, two RX DDCs active)? Needs a key‑down capture
-  with RX2 on. Not needed for RX‑only dual‑watch, but relevant for TX‑while‑
-  monitoring.
 - **RX2 phase‑offset repeatability across power cycles.** Within a session the
   offset is fixed‑but‑not‑repeatable across stream restarts (§4b); whether a
   full power‑cycle changes anything about the coherence relationship is

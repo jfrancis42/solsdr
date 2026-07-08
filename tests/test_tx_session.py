@@ -162,8 +162,86 @@ def test_power_limit_calibration_aware():
     print('PASS power limit: read-only, calibration-gated, clamps watts + raw')
 
 
+def _iq_iter(seconds=2, wire_rate=PRO.wire_rate):
+    """Yield complex baseband IQ blocks at the wire rate (a pure carrier at
+    +1 kHz baseband, amplitude 0.5)."""
+    n = int(wire_rate / 50)  # ~20 ms blocks
+    ph = 0.0
+    dphi = 2 * np.pi * 1000.0 / wire_rate
+    for _ in range(seconds * 50):
+        idx = np.arange(n)
+        blk = 0.5 * np.exp(1j * (ph + dphi * idx))
+        ph = (ph + dphi * n) % (2 * np.pi)
+        yield blk.astype(np.complex64)
+
+
+def test_raw_iq_tx_passthrough():
+    """iq_input=True must transmit the supplied complex samples verbatim
+    (gain+clip only) — no modulation, no resampling — as valid 0xFD frames."""
+    if not hasattr(os, 'timerfd_create'):
+        print('SKIP: timerfd unavailable'); return
+    from solsdr.tx_session import TXSession
+    from solsdr.protocol import packet as pk
+
+    rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rx.bind(('127.0.0.1', 0)); rx.settimeout(2)
+    port = rx.getsockname()[1]
+    got = []
+
+    def rxloop():
+        while True:
+            try:
+                d, _ = rx.recvfrom(2048)
+            except socket.timeout:
+                return
+            got.append(d)
+    t = threading.Thread(target=rxloop, daemon=True); t.start()
+
+    r = FakeRadio()
+    tx = TXSession(r, mode='USB', realtime=False,
+                   loopback_dest=('127.0.0.1', port), verbose=False)
+    tx.arm(confirm=True)
+    tx.enter_tx(_iq_iter(2), raw_drive=40, iq_input=True)
+    time.sleep(1.5)
+    tx.exit_tx()
+    time.sleep(0.3)
+    rx.close()
+
+    # find a non-silence TX frame and decode it; its magnitude should be ~0.5
+    # (our input amplitude), proving verbatim pass-through, not modulation.
+    found = None
+    for d in got:
+        if len(d) == 1210 and d[2] == 0xFD:
+            iq = pk.decode_iq_packet(d, PRO.magic)
+            if np.max(np.abs(iq)) > 0.1:
+                found = iq
+                break
+    assert found is not None, 'no non-silent raw-IQ TX frame received'
+    peak = float(np.max(np.abs(found)))
+    assert 0.4 < peak < 0.6, f'raw IQ amplitude not preserved: peak={peak:.3f}'
+    print(f'PASS raw-IQ passthrough: {len(got)} frames, peak={peak:.3f} (~0.5 in)')
+
+
+def test_raw_iq_tx_gain_and_clip():
+    """tx_iq_gain scales input; clip keeps |IQ| <= ~0.98 so 24-bit never wraps."""
+    from solsdr.tx_session import TXSession
+    r = FakeRadio()
+    tx = TXSession(r, realtime=False, verbose=False)
+    # gain applied
+    tx.tx_iq_gain = 2.0
+    out = tx._prep_iq(np.full(10, 0.25 + 0j, dtype=np.complex64))
+    assert np.allclose(np.abs(out), 0.5, atol=1e-3), np.abs(out)[:3]
+    # clip: huge input pinned under the packing ceiling
+    tx.tx_iq_gain = 1.0
+    out2 = tx._prep_iq(np.full(10, 5.0 + 0j, dtype=np.complex64))
+    assert float(np.max(np.abs(out2))) <= 0.98 + 1e-6
+    print('PASS raw-IQ gain + clip')
+
+
 if __name__ == '__main__':
     test_unarmed_never_keys()
     test_armed_ordering()
     test_power_limit_calibration_aware()
+    test_raw_iq_tx_passthrough()
+    test_raw_iq_tx_gain_and_clip()
     print('\nTX SESSION TESTS PASSED')

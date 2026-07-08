@@ -85,7 +85,7 @@ class RealtimeTX:
 
     def _log(self, *a):
         if self.verbose:
-            print('[tx]', *a)
+            from .log import log_line; log_line('tx', ' '.join(str(x) for x in a))
 
     def _packet_source(self):
         """Called by the pacer each tick: return one 1210-byte TX packet, or

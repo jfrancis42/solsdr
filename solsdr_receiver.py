@@ -47,6 +47,23 @@ class _RadioControlAdapter:
     def set_ptt(self, on):
         return False  # RX-only for now
 
+    # RX DSP + front-end controls exposed to the network control API (act on
+    # RX1's channel; the radio-level preamp affects the whole front end).
+    def set_preamp(self, state):
+        return self._rx.radio.set_preamp(state)
+
+    def set_rit(self, hz):
+        self._rx.channels[0].demod.set_rit(hz); return True
+
+    def set_squelch(self, level):
+        self._rx.channels[0].filters.squelch.level = float(level); return True
+
+    def set_agc(self, mode):
+        self._rx.channels[0].demod.set_agc(mode); return True
+
+    def set_nr(self, level):
+        self._rx.channels[0].filters.nr.level = float(level); return True
+
     @property
     def current_freq(self):
         return self._rx.radio.current_freq
@@ -58,6 +75,11 @@ class _RadioControlAdapter:
     @property
     def streaming(self):
         return self._rx.radio.streaming
+
+    @property
+    def s_meter(self):
+        # RX1's smoothed signal level in dBFS (already computed each block).
+        return self._rx.channels[0].demod.s_meter
 
 
 class _RXChannel:
@@ -294,6 +316,17 @@ def interactive_loop(rx):
                 print(f'  mic source -> {src}')
             except ValueError as e:
                 print(f'  {e}')
+        elif line.startswith('preamp '):
+            st = line[7:].strip()
+            try:
+                rx.radio.set_preamp(st)
+                print(f'  preamp/att -> {st}')
+            except ValueError as e:
+                print(f'  {e}')
+        elif line.startswith('rit '):
+            hz = float(line[4:])
+            rx.channels[target_rx].demod.set_rit(hz)
+            print(f'  RX{target_rx + 1} RIT -> {hz:g} Hz')
         elif line.startswith('nr '):
             rx.filters.nr.level = float(line[3:]); print(f'  NR={rx.filters.nr.level}')
         elif line.startswith('nb '):
@@ -314,7 +347,17 @@ def interactive_loop(rx):
 
 
 def main():
+    from solsdr import __version__
+    from solsdr.config import load as load_config
+    from solsdr.log import setup_logging
     ap = argparse.ArgumentParser()
+    ap.add_argument('--version', action='version',
+                    version=f'solsdr {__version__}')
+    ap.add_argument('--config', default=None,
+                    help='config file (default: ~/.config/solsdr/config.*)')
+    ap.add_argument('--log-level', default='info',
+                    choices=['debug', 'info', 'warning', 'error'],
+                    help='logging verbosity (default info)')
     ap.add_argument('freq_khz', nargs='?', type=float, default=14074.0)
     ap.add_argument('--mode', default='USB')
     ap.add_argument('--device', type=int, default=5,
@@ -347,6 +390,22 @@ def main():
                     help='also stream raw complex64 IQ to TCP clients on :5555 '
                          '(GNU Radio TCP source, recorders, etc.)')
     ap.add_argument('--iq-port', type=int, default=5555)
+    ap.add_argument('--iq-tx-server', action='store_true',
+                    help='accept raw complex64 IQ from a TCP client and TRANSMIT '
+                         'it (the transmit counterpart to --iq-server). Requires '
+                         '--tx-arm to actually key; without it the chain runs '
+                         'with NO RF (safe wiring test).')
+    ap.add_argument('--iq-tx-port', type=int, default=5558,
+                    help='port for the raw-IQ TX server (default 5558)')
+    ap.add_argument('--tx-arm', action='store_true',
+                    help='ARM the raw-IQ TX server to actually key the radio. '
+                         'Off by default. ALWAYS transmit into a dummy load first.')
+    ap.add_argument('--tx-watts', type=float, default=None,
+                    help='TX output setpoint in watts for the raw-IQ TX server '
+                         '(per-band calibration required)')
+    ap.add_argument('--max-power-watts', type=float, default=None,
+                    help='amp-protection output ceiling in watts for TX '
+                         '(clamps drive; refuses to key on an uncalibrated band)')
     ap.add_argument('--rx2', type=float, default=None, metavar='KHZ',
                     help='enable the second receiver at this frequency (kHz). '
                          'Both receivers share the one wire rate (--rate).')
@@ -357,7 +416,21 @@ def main():
                          'no audio). Use a second device for dual-watch listening.')
     ap.add_argument('--seconds', type=int, default=None,
                     help='run headless for N seconds then exit (no prompt)')
+
+    # Apply config-file values as argparse defaults so explicit CLI args still
+    # win (CLI > config file > built-in default). Pre-parse only to learn
+    # --config; unknown config keys are ignored with a warning.
+    pre, _ = ap.parse_known_args()
+    cfg = load_config(pre.config)
+    if cfg:
+        known = {a.dest for a in ap._actions}
+        good = {k: v for k, v in cfg.items() if k in known}
+        for k in cfg:
+            if k not in known:
+                print(f'[config] ignoring unknown key: {k}')
+        ap.set_defaults(**good)
     args = ap.parse_args()
+    setup_logging(args.log_level)
 
     rx = AudioReceiver(args.freq_khz, mode=args.mode, device=args.device,
                        local_ip=args.local_ip, radio_ip=args.radio_ip,
@@ -400,6 +473,18 @@ def main():
             servers.append(iqs2)
             print(f'RX2 IQ stream server on :{rx2_port} (complex64 @ '
                   f'{rx.radio.wire_rate:.0f} Hz)')
+    if args.iq_tx_server:
+        from solsdr.api.iq_tx_server import IQTXServer
+        txs = IQTXServer(rx.radio, port=args.iq_tx_port, mode=args.mode,
+                         armed=args.tx_arm, watts=args.tx_watts,
+                         max_power_watts=args.max_power_watts)
+        txs.start(); servers.append(txs)
+        state = 'ARMED — will key on connect' if args.tx_arm else 'NO RF (use --tx-arm to key)'
+        print(f'raw-IQ TX server on :{args.iq_tx_port} (complex64 @ '
+              f'{rx.radio.wire_rate:.0f} Hz) [{state}]')
+        if args.tx_arm:
+            print('  ⚠️  TX is ARMED. Connect a client and it WILL transmit. '
+                  'Dummy load!')
 
     try:
         if args.seconds:

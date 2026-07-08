@@ -1,0 +1,17 @@
+include LICENSE
+include README.md
+include ARTEMISSDR.md
+include CHANGELOG.md
+include requirements.txt
+
+# Ship the systemd unit templates as examples.
+recursive-include systemd *.service *.md
+
+# Keep local/dev material out of the distribution.
+prune keep
+prune reference
+prune tests
+prune clients
+prune tools
+global-exclude *.pcap *.pcapng *.npy
+global-exclude __pycache__ *.py[cod]

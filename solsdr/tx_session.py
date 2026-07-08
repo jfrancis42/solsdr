@@ -89,6 +89,11 @@ class TXSession:
 
         self.mod = Modulator(audio_rate=audio_rate, wire_rate=self.wire_rate,
                              mode=self.mode)
+        # Gain applied to RAW-IQ TX input (iq_input=True path) before clipping.
+        # The audio path is leveled inside the Modulator; the raw-IQ path is not,
+        # so the caller controls amplitude here (1.0 = pass-through, expecting
+        # samples already in [-1, 1]).
+        self.tx_iq_gain = 1.0
         self._iq_buf = np.zeros(0, dtype=np.complex64)
         self._buf_lock = threading.Lock()
         self._seq = 0
@@ -108,7 +113,7 @@ class TXSession:
 
     def _log(self, *a):
         if self.verbose:
-            print('[tx-session]', *a)
+            from .log import log_line; log_line('tx-session', ' '.join(str(x) for x in a))
 
     @property
     def max_power_watts(self):
@@ -217,16 +222,31 @@ class TXSession:
         self._seq = (self._seq + 1) & 0xFFFF
         return pktb
 
-    def _feed_loop(self, audio_iter):
+    def _prep_iq(self, block) -> np.ndarray:
+        """Condition one block of RAW complex IQ (already at wire_rate) for the
+        TX buffer: apply tx_iq_gain and clip to the 24-bit-safe unit range so
+        packing never wraps. No modulation, no resampling — the caller is
+        responsible for delivering complex samples at the radio wire rate."""
+        iq = np.asarray(block, dtype=np.complex64)
+        if len(iq) == 0:
+            return iq
+        if self.tx_iq_gain != 1.0:
+            iq = iq * self.tx_iq_gain
+        peak = float(np.max(np.abs(iq)))
+        if peak > 0.98:
+            iq = iq * (0.98 / peak)
+        return iq.astype(np.complex64)
+
+    def _feed_loop(self, source_iter, iq_input=False):
         import time
         target_ahead = int(self.wire_rate * 0.8)
-        for block in audio_iter:
+        for block in source_iter:
             if not self._running:
                 break
-            iq = self.mod.process(block)
+            iq = self._prep_iq(block) if iq_input else self.mod.process(block)
             with self._buf_lock:
                 self._iq_buf = np.concatenate([self._iq_buf, iq])
-            # Real audio is still flowing -> refresh the dead-man. This keeps a
+            # Real signal is still flowing -> refresh the dead-man. This keeps a
             # legitimate long over (WSPR, ragchew, big file) alive indefinitely
             # while a genuinely stalled source still trips the timeout.
             self.kick_deadman()
@@ -237,11 +257,18 @@ class TXSession:
                 time.sleep(0.02)
 
     # -- session -----------------------------------------------------------
-    def enter_tx(self, audio_iter, watts: Optional[float] = None,
+    def enter_tx(self, source_iter, watts: Optional[float] = None,
                  raw_drive: Optional[int] = None, pa: bool = False,
-                 prebuffer_s: float = 0.5):
-        """Begin a keyed TX session sourced from audio_iter.
+                 prebuffer_s: float = 0.5, iq_input: bool = False):
+        """Begin a keyed TX session sourced from source_iter.
 
+        source_iter: by default yields real-audio blocks (fed through the
+            modulator). If iq_input=True it yields COMPLEX baseband IQ blocks
+            already at the radio wire_rate (self.wire_rate), which are sent
+            verbatim (gain + clip only, no modulation/resample) — this is the
+            raw-IQ TX path for GNU Radio and custom waveform generators. The
+            radio's TX mode/config-block is still set; on the SunSDR2 the
+            0xFD IQ stream is the modulator's baseband input regardless.
         watts/raw_drive: set power before keying (watts via cal table, or raw).
         pa: enable the internal PA (0x24=1) — only if you have a PA and mean it.
         prebuffer_s: how much IQ to accumulate before keying. 0.5 s is safe for
@@ -256,8 +283,10 @@ class TXSession:
         import time
         ctrl = self.radio.ctrl
         self._seq = 0
-        self.mod = Modulator(audio_rate=self.audio_rate, wire_rate=self.wire_rate,
-                             mode=self.mode)  # fresh filter state each session
+        # Fresh modulator state each audio session (unused on the raw-IQ path).
+        if not iq_input:
+            self.mod = Modulator(audio_rate=self.audio_rate,
+                                 wire_rate=self.wire_rate, mode=self.mode)
 
         # power first (state only; safe unkeyed)
         if watts is not None:
@@ -280,7 +309,9 @@ class TXSession:
 
         # pre-buffer IQ before we key / pace
         self._feeder = threading.Thread(target=self._feed_loop,
-                                        args=(audio_iter,), daemon=True)
+                                        args=(source_iter,),
+                                        kwargs={'iq_input': iq_input},
+                                        daemon=True)
         self._feeder.start()
         need = int(self.wire_rate * prebuffer_s)
         deadline = time.time() + 3.0

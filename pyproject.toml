@@ -9,10 +9,15 @@ description = "Direct network control and IQ streaming for the SunSDR2 PRO (no E
 readme = "README.md"
 requires-python = ">=3.10"
 license = "GPL-2.0-only"
+authors = [{ name = "Jeff Francis, N0GQ" }]
+keywords = ["sdr", "ham-radio", "sunsdr2", "iq", "gnuradio", "js8call", "wsjt-x"]
 classifiers = [
-    "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+    "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Operating System :: POSIX :: Linux",
     "Topic :: Communications :: Ham Radio",
+    "Intended Audience :: Science/Research",
 ]
 dependencies = [
     "numpy>=1.24",
@@ -20,12 +25,24 @@ dependencies = [
     "sounddevice>=0.4.6",
 ]
 
+[project.urls]
+Homepage = "https://github.com/jfrancis42/solsdr"
+Repository = "https://github.com/jfrancis42/solsdr"
+Issues = "https://github.com/jfrancis42/solsdr/issues"
+
 [project.optional-dependencies]
 tools = ["matplotlib>=3.7"]
 
 [project.scripts]
+solsdr = "solsdr_receiver:main"
 solsdr-receiver = "solsdr_receiver:main"
 
 [tool.setuptools]
-packages = ["solsdr", "solsdr.protocol", "solsdr.dsp", "solsdr.api"]
+packages = [
+    "solsdr",
+    "solsdr.protocol",
+    "solsdr.dsp",
+    "solsdr.api",
+    "solsdr.audio",
+]
 py-modules = ["solsdr_receiver"]
