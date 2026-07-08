@@ -184,10 +184,41 @@ index→receiver mapping: byte9=`00` tracked the busy FT8 band (peaks ~−95 dBm
 byte9=`01` the empty band (~−115 dBm) — index 0's IQ magnitude ran consistently
 higher at every percentile.
 
-Implementation is therefore small: read byte 9, route to per‑receiver
-demod/consumers; enable via byte 54 = `0x02` (already coded); the keepalive echo
-likely needs to reflect the receiver count. The `0x1B`‑is‑HF.LPF vs. RX2
-confusion (§4) does not affect any of this — RX2 has no toggle opcode at all.
+**Keepalive with two receivers.** The `0xFE` silence echo is sent **once per
+sequence tick, not once per packet.** Measured: single‑RX = ~122 pkt/s received,
+~122/s echoed (1:1); with RX2 on = ~329/s received total (~165/s per receiver)
+but still only ~165/s echoed. Since the two receivers share the sequence counter
+and alternate, the clean rule is **echo only on byte9 == 0 (RX1)** — that yields
+exactly one echo per tick in both 1‑RX and 2‑RX modes. Echoing per‑packet sends
+2× the pokes (probably harmless, but not what ExpertSDR3 does).
+
+Implemented in this project: `decode_iq_packet_rx()` returns `(rx_index,
+samples)` from byte 9; the RX loop routes per index to per‑receiver demods,
+echoes keepalive on index 0, and delivers a 2‑arg `callback(rx_index, iq)`;
+enable via byte 54 = `0x02` at power‑on; RX2 tuned with the freq sub‑index
+(RX1=0, RX2=1). The `0x1B`‑is‑HF.LPF vs. RX2 confusion (§4) is unrelated — RX2
+has no toggle opcode at all.
+
+### RX1↔RX2 phase coherence (verified, γ² ≈ 0.999)
+
+With a single shared antenna/ADC feeding both DDCs, the two receivers are
+**strongly phase‑coherent** — magnitude‑squared coherence **γ² ≈ 0.999** at the
+signal. So a PRO can serve as a coherent dual‑channel receiver (DF, beamforming,
+two‑antenna noise cancelling) — with two caveats found in testing:
+
+- **Measure it spectrally, at the signal.** Tune both RX to the same frequency,
+  Welch‑average the cross‑spectrum, and take γ²(f) = |Sxy|²/(Sxx·Syy) in the
+  strongest bins. A whole‑band time‑domain average on a weak/bursty signal is
+  swamped by uncorrelated noise and *falsely* reads γ≈0.26 even when locked
+  (the tell: phase jitter stays ~4–10° throughout). The per‑bin method reads
+  0.999.
+- **The fixed phase offset does NOT survive a stream restart/retune** (measured
+  −69°/−61°/−178° across runs), so coherent applications need a **per‑session
+  phase calibration** against a common reference, not a baked‑in constant.
+- Coherence is a same‑frequency property: RX on two different bands correlate at
+  γ²≈0 (different signals), as expected. Real DF also needs two *separate*
+  antennas — the shared‑antenna coherence is what makes the inter‑antenna phase
+  difference meaningful once you split the feed.
 
 ## 5. Other PRO facts we found differ from the reference
 
@@ -242,24 +273,32 @@ upstream TX implementation:
 
 ---
 
+## Resolved since first writing (for reference)
+
+- **RX2 second receiver — done.** Enable, per‑receiver tuning, IQ‑stream
+  demux (header byte 9), keepalive, and phase coherence are all worked out and
+  implemented; see §4b.
+- **Fan / temperature — nothing to send.** The radio regulates its fan
+  autonomously in firmware. The fan cycles on its own while solsdr runs (solsdr
+  sends no fan/temp command), and a 2026‑07‑08 control‑socket capture while
+  trying to change the setting in ExpertSDR3 showed **zero directed host→radio
+  commands** — the installed ExpertSDR3 only *displays* temperature. Host temp
+  is read from the `0x1F` telemetry (§3). (An operator recalled ExpertSDR2
+  allowing a temperature set; if it existed it was removed/changed in v3.)
+
 ## Still to capture / confirm
 
 - **Antenna port selection.** ArtemisSDR uses `0x15` (+ `0x1E` preamble); a PRO
   capture showed `0x15` staying `00` while `0x1e`/`0x20` moved, so the PRO
   mapping differs. Needs a clean one‑selector‑at‑a‑time recapture — not pursued
   further yet.
-- **Fan / temperature control — RESOLVED: nothing to send.** The fan is
-  regulated **entirely by the radio firmware.** The fan cycles on its own while
-  solsdr runs (solsdr sends no fan/temp command at all), so ExpertSDR3 is not
-  driving it over the wire. Confirmed by capture (2026‑07‑08): the installed
-  ExpertSDR3 only *displays* temperature and provides no control to set it — and
-  a control‑socket capture while attempting to change the setting showed **zero
-  directed host→radio commands.** (The operator recalled ExpertSDR2 allowing a
-  temperature set; if that existed it was removed/changed in v3.) Host temp is
-  read from the `0x1F` telemetry (§3). So there is no setpoint opcode to
-  reverse‑engineer or implement — the radio self‑regulates.
-- **Second IQ stream for RX2.** The RX2 *enable* selector is known (STATE_SYNC
-  byte 54 — see §4b); actually *using* the second receiver additionally requires
-  handling its IQ stream, which we haven't implemented.
+- **TX behavior with RX2 enabled.** Does either receiver keep streaming through
+  a key‑down (single transmitter, two RX DDCs active)? Needs a key‑down capture
+  with RX2 on. Not needed for RX‑only dual‑watch, but relevant for TX‑while‑
+  monitoring.
+- **RX2 phase‑offset repeatability across power cycles.** Within a session the
+  offset is fixed‑but‑not‑repeatable across stream restarts (§4b); whether a
+  full power‑cycle changes anything about the coherence relationship is
+  untested.
 - **DX hardware verification.** The DX profile here is populated from the
   ArtemisSDR reference but has never run against a real DX.

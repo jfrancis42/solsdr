@@ -60,69 +60,110 @@ class _RadioControlAdapter:
         return self._rx.radio.streaming
 
 
-class AudioReceiver:
-    def __init__(self, freq_khz, mode='USB', device=5, local_ip='10.1.2.185',
-                 radio_ip='10.1.2.3', variant='PRO', sample_rate=None,
-                 ext_ref=None):
-        self.freq_hz = int(freq_khz * 1000)
-        self.device = device
-        self.ext_ref = ext_ref
-        self.radio = Radio(radio_ip=radio_ip, local_ip=local_ip,
-                           variant=variant, auto_reconnect=True,
-                           on_state_change=self._on_state_change,
-                           sample_rate=sample_rate)
-        # Demod runs at the radio's actual IQ rate (verified PRO: 39062.5,
-        # 78125, 156250, or 312500 Hz depending on --rate).
-        self.demod = Demodulator(wire_rate=self.radio.wire_rate,
-                                 audio_rate=AUDIO_RATE, mode=mode)
-        # ~50 ms processing chunk, scaled to the wire rate (bigger at high rates
-        # so the resampler stays well above realtime).
-        self._chunk_n = max(2000, int(self.radio.wire_rate * 0.05) // 200 * 200)
-        # Post-demod stateful filter chain (NR/NB/notch/APF/squelch), all off
-        # by default — enable via the interactive shell.
+class _RXChannel:
+    """Per-receiver demod + filter + audio-out + IQ-sink state. AudioReceiver
+    owns one (RX1) or two (RX1+RX2) of these; the RX-loop callback routes IQ to
+    the right channel by receiver index."""
+    def __init__(self, wire_rate, mode, chunk_n, device):
+        self.demod = Demodulator(wire_rate=wire_rate, audio_rate=AUDIO_RATE,
+                                 mode=mode)
         from solsdr.dsp.filters import RXFilterChain
         self.filters = RXFilterChain(AUDIO_RATE, cw_pitch=self.demod.cw_pitch)
-        # Optional live Morse decoder (created on demand in CW mode).
+        self._chunk_n = chunk_n
+        self.device = device
         self.cw_decoder = None
         self.stream = None
+        self.iq_sink = None            # raw-IQ fan-out (IQ server / recorder)
         self.iq_buf = np.zeros(0, dtype=np.complex64)
         self._lock = threading.Lock()
-        # Optional raw-IQ fan-out (e.g. IQStreamServer.publish) for network
-        # clients like GNU Radio. Receives every raw IQ block before demod.
-        self.iq_sink = None
+        self._print_cw = False         # print decoded CW to stdout (RX1 only)
 
-    def _on_state_change(self, state):
-        # Surface reconnection activity to the user.
-        print(f'\n[link] {state}')
-
-    def _on_iq(self, iq):
-        # Fan raw IQ out to any network sink first (GNU Radio clients, etc.).
+    def feed(self, iq):
         if self.iq_sink is not None:
             try:
                 self.iq_sink(iq)
             except Exception:
                 pass
-        # Accumulate and process in ~50 ms chunks. Scale the chunk with the wire
-        # rate (2000 @ 39 kHz, ~16k @ 312.5 kHz) so the resampler's per-call FIR
-        # setup amortizes and high rates stay comfortably above realtime.
-        chunk_n = self._chunk_n
         with self._lock:
             self.iq_buf = np.concatenate([self.iq_buf, iq])
-            while len(self.iq_buf) >= chunk_n:
-                chunk = self.iq_buf[:chunk_n]
-                self.iq_buf = self.iq_buf[chunk_n:]
+            while len(self.iq_buf) >= self._chunk_n:
+                chunk = self.iq_buf[:self._chunk_n]
+                self.iq_buf = self.iq_buf[self._chunk_n:]
                 audio = self.demod.process(chunk)
                 audio = self.filters.process(audio)
-                # Live CW decode: feed the decoder and print decoded text.
                 if self.cw_decoder is not None and len(audio):
                     txt = self.cw_decoder.process(audio)
-                    if txt:
+                    if txt and self._print_cw:
                         sys.stdout.write(txt); sys.stdout.flush()
                 if self.stream and len(audio):
                     try:
                         self.stream.write(audio)
                     except Exception:
                         pass
+
+
+class AudioReceiver:
+    def __init__(self, freq_khz, mode='USB', device=5, local_ip='10.1.2.185',
+                 radio_ip='10.1.2.3', variant='PRO', sample_rate=None,
+                 ext_ref=None, rx2_khz=None, rx2_mode=None, rx2_device=None):
+        self.freq_hz = int(freq_khz * 1000)
+        self.device = device
+        self.ext_ref = ext_ref
+        self.rx2_hz = int(rx2_khz * 1000) if rx2_khz else None
+        self.rx2_device = rx2_device
+        self.radio = Radio(radio_ip=radio_ip, local_ip=local_ip,
+                           variant=variant, auto_reconnect=True,
+                           on_state_change=self._on_state_change,
+                           sample_rate=sample_rate, rx2=self.rx2_hz is not None)
+        # ~50 ms processing chunk, scaled to the wire rate (bigger at high rates
+        # so the resampler stays well above realtime).
+        self._chunk_n = max(2000, int(self.radio.wire_rate * 0.05) // 200 * 200)
+        # Channel 0 = RX1 (always), channel 1 = RX2 (optional).
+        self.channels = [_RXChannel(self.radio.wire_rate, mode, self._chunk_n,
+                                    device)]
+        self.channels[0]._print_cw = True
+        if self.rx2_hz is not None:
+            self.channels.append(_RXChannel(self.radio.wire_rate,
+                                            rx2_mode or mode, self._chunk_n,
+                                            rx2_device))
+
+    def _on_state_change(self, state):
+        # Surface reconnection activity to the user.
+        print(f'\n[link] {state}')
+
+    def _on_iq(self, iq):
+        # Single-RX callback (1-arg): all IQ is RX1 -> channel 0.
+        self.channels[0].feed(iq)
+
+    def _on_iq_rx(self, rx_index, iq):
+        # Two-receiver callback: route by receiver index.
+        if 0 <= rx_index < len(self.channels):
+            self.channels[rx_index].feed(iq)
+
+    @property
+    def demod(self):
+        # Back-compat: RX1's demod (many callers reference rx.demod).
+        return self.channels[0].demod
+
+    @property
+    def filters(self):
+        # Back-compat: RX1's filter chain (shell nr/nb/notch/apf/sql commands).
+        return self.channels[0].filters
+
+    @property
+    def iq_sink(self):
+        return self.channels[0].iq_sink
+
+    @iq_sink.setter
+    def iq_sink(self, fn):
+        # Back-compat: setting rx.iq_sink targets RX1's channel.
+        self.channels[0].iq_sink = fn
+
+    def _open_stream(self, device):
+        s = sd.OutputStream(samplerate=AUDIO_RATE, channels=1, dtype='float32',
+                            device=device, latency='high')
+        s.start()
+        return s
 
     def start(self):
         if not self.radio.open():
@@ -131,41 +172,60 @@ class AudioReceiver:
         # Apply reference-clock preference if the user set --ext-ref / --no-ext-ref.
         if self.ext_ref is not None:
             self.radio.set_reference(self.ext_ref)
-        self.stream = sd.OutputStream(samplerate=AUDIO_RATE, channels=1,
-                                      dtype='float32', device=self.device,
-                                      latency='high')
-        self.stream.start()
-        self.radio.start_stream(self._on_iq, freq_hz=self.freq_hz)
-        print(f'receiving {self.freq_hz/1000:.1f} kHz {self.demod.mode}, '
-              f'audio -> device {self.device}')
+        # RX1 audio out.
+        self.channels[0].stream = self._open_stream(self.device)
+        if self.rx2_hz is not None:
+            # RX2 audio out only if a device was given (else RX2 is IQ-only).
+            if self.rx2_device is not None:
+                self.channels[1].stream = self._open_stream(self.rx2_device)
+            self.radio.start_stream(self._on_iq_rx, freq_hz=self.freq_hz)
+            self.radio.set_frequency(self.rx2_hz, rx=1)
+            self.radio.set_mode(self.channels[1].demod.mode, rx=1)
+            print(f'RX1 {self.freq_hz/1000:.1f} kHz {self.channels[0].demod.mode} '
+                  f'-> device {self.device}')
+            print(f'RX2 {self.rx2_hz/1000:.1f} kHz {self.channels[1].demod.mode}'
+                  + (f' -> device {self.rx2_device}' if self.rx2_device is not None
+                     else ' (IQ only)'))
+        else:
+            self.radio.start_stream(self._on_iq, freq_hz=self.freq_hz)
+            print(f'receiving {self.freq_hz/1000:.1f} kHz {self.demod.mode}, '
+                  f'audio -> device {self.device}')
         return True
 
-    def tune(self, freq_khz):
-        self.freq_hz = int(freq_khz * 1000)
-        self.radio.set_frequency(self.freq_hz)
+    def tune(self, freq_khz, rx=0):
+        hz = int(freq_khz * 1000)
+        if rx == 0:
+            self.freq_hz = hz
+        else:
+            self.rx2_hz = hz
+        self.radio.set_frequency(hz, rx=rx)
 
-    def set_mode(self, mode):
-        self.demod.set_mode(mode)
-        self.radio.set_mode(mode)
-        # keep the APF center on the CW pitch when relevant
-        self.filters.apf.set(center_hz=self.demod.cw_pitch)
+    def set_mode(self, mode, rx=0):
+        ch = self.channels[rx]
+        ch.demod.set_mode(mode)
+        self.radio.set_mode(mode, rx=rx)
+        ch.filters.apf.set(center_hz=ch.demod.cw_pitch)
 
-    def cw_decode(self, on):
-        """Enable/disable the live Morse decoder (CW modes)."""
+    def cw_decode(self, on, rx=0):
+        """Enable/disable the live Morse decoder (CW modes) for a receiver."""
+        ch = self.channels[rx]
         if on:
             from solsdr.dsp.cw_decode import CWDecoder
-            self.cw_decoder = CWDecoder(sample_rate=AUDIO_RATE,
-                                        pitch=self.demod.cw_pitch)
+            ch.cw_decoder = CWDecoder(sample_rate=AUDIO_RATE,
+                                      pitch=ch.demod.cw_pitch)
             return True
-        self.cw_decoder = None
+        ch.cw_decoder = None
         return False
 
     def status(self):
-        f = self.radio.current_freq or 0
-        s = (f'freq={f/1000:.1f} kHz mode={self.demod.mode} '
-             f'S={self.demod.s_meter:.0f} dBFS '
-             f'pkts={self.radio.packets_received} '
-             f'streaming={self.radio.streaming}')
+        def one(label, ch, freq):
+            return (f'{label} freq={ (freq or 0)/1000:.1f} kHz '
+                    f'mode={ch.demod.mode} S={ch.demod.s_meter:.0f} dBFS')
+        s = one('RX1', self.channels[0], self.radio.current_freq)
+        if len(self.channels) > 1:
+            s += '  ||  ' + one('RX2', self.channels[1], self.rx2_hz)
+        s += (f' | pkts={self.radio.packets_received} '
+              f'streaming={self.radio.streaming}')
         t = self.radio.telemetry
         if t:
             s += (f' | {t["voltage"]:.1f}V {t["current"]:.2f}A '
@@ -174,15 +234,20 @@ class AudioReceiver:
 
     def stop(self):
         self.radio.close()
-        if self.stream:
-            self.stream.stop(); self.stream.close()
+        for ch in self.channels:
+            if ch.stream:
+                ch.stream.stop(); ch.stream.close()
 
 
 def interactive_loop(rx):
+    dual = len(rx.channels) > 1
     print('commands: <kHz> tune | m <mode> (USB/LSB/AM/FM/CW/CWU/CWL) | '
           'cw on|off (Morse decode) | ref ext|int (10 MHz reference) | '
           'nr <0-1> | nb <0-1> | notch <Hz|0> | apf <0-1> | sql <0-1> | '
           's status | q quit')
+    if dual:
+        print('  RX2 active: prefix tune/m/cw with "2 " for RX2 '
+              '(e.g. "2 7074", "2 m CW"); bare commands act on RX1.')
     while True:
         try:
             line = input('sdr> ').strip()
@@ -192,16 +257,24 @@ def interactive_loop(rx):
             continue
         if line in ('q', 'quit', 'exit'):
             break
+        # RX selector prefix: "1 <cmd>" / "2 <cmd>" targets RX1/RX2 for the
+        # per-receiver commands (tune / m / cw). Bare commands default to RX1.
+        target_rx = 0
+        if len(line) > 2 and line[0] in '12' and line[1] == ' ':
+            target_rx = int(line[0]) - 1
+            line = line[2:].strip()
+            if target_rx >= len(rx.channels):
+                print(f'  RX{target_rx + 1} not active'); continue
         if line == 's':
             print('  ' + rx.status())
         elif line.startswith('m '):
             mode = line[2:].strip().upper()
-            rx.set_mode(mode)
-            print(f'  mode -> {mode}')
+            rx.set_mode(mode, rx=target_rx)
+            print(f'  RX{target_rx + 1} mode -> {mode}')
         elif line.startswith('cw '):
             on = line[3:].strip().lower() in ('on', '1', 'true')
-            rx.cw_decode(on)
-            print(f'  CW decode -> {"ON" if on else "off"}')
+            rx.cw_decode(on, rx=target_rx)
+            print(f'  RX{target_rx + 1} CW decode -> {"ON" if on else "off"}')
         elif line.startswith('ref '):
             ext = line[4:].strip().lower() in ('ext', 'external', 'on', '1')
             rx.radio.set_reference(ext)
@@ -234,8 +307,8 @@ def interactive_loop(rx):
         else:
             try:
                 khz = float(line)
-                rx.tune(khz)
-                print(f'  tuned -> {khz} kHz')
+                rx.tune(khz, rx=target_rx)
+                print(f'  RX{target_rx + 1} tuned -> {khz} kHz')
             except ValueError:
                 print('  ? see command list above')
 
@@ -274,6 +347,14 @@ def main():
                     help='also stream raw complex64 IQ to TCP clients on :5555 '
                          '(GNU Radio TCP source, recorders, etc.)')
     ap.add_argument('--iq-port', type=int, default=5555)
+    ap.add_argument('--rx2', type=float, default=None, metavar='KHZ',
+                    help='enable the second receiver at this frequency (kHz). '
+                         'Both receivers share the one wire rate (--rate).')
+    ap.add_argument('--rx2-mode', default=None,
+                    help='demod mode for RX2 (default: same as --mode)')
+    ap.add_argument('--rx2-device', type=int, default=None,
+                    help='audio output device for RX2 (default: IQ/monitor only, '
+                         'no audio). Use a second device for dual-watch listening.')
     ap.add_argument('--seconds', type=int, default=None,
                     help='run headless for N seconds then exit (no prompt)')
     args = ap.parse_args()
@@ -281,7 +362,8 @@ def main():
     rx = AudioReceiver(args.freq_khz, mode=args.mode, device=args.device,
                        local_ip=args.local_ip, radio_ip=args.radio_ip,
                        variant=args.variant, sample_rate=args.rate,
-                       ext_ref=args.ext_ref)
+                       ext_ref=args.ext_ref, rx2_khz=args.rx2,
+                       rx2_mode=args.rx2_mode, rx2_device=args.rx2_device)
     if not rx.start():
         sys.exit(1)
 
@@ -305,10 +387,19 @@ def main():
         from solsdr.api.iq_server import IQStreamServer
         iqs = IQStreamServer(port=args.iq_port)
         iqs.start(rate=rx.radio.wire_rate, freq=rx.freq_hz)
-        rx.iq_sink = iqs.publish
+        rx.channels[0].iq_sink = iqs.publish
         servers.append(iqs)
-        print(f'IQ stream server on :{args.iq_port} (complex64 @ '
+        print(f'RX1 IQ stream server on :{args.iq_port} (complex64 @ '
               f'{rx.radio.wire_rate:.0f} Hz)')
+        # RX2 on its own port (default 5557; 5556 is the control API).
+        if args.rx2 is not None:
+            rx2_port = args.iq_port + 2 if args.iq_port == 5555 else args.iq_port + 1
+            iqs2 = IQStreamServer(port=rx2_port)
+            iqs2.start(rate=rx.radio.wire_rate, freq=rx.rx2_hz)
+            rx.channels[1].iq_sink = iqs2.publish
+            servers.append(iqs2)
+            print(f'RX2 IQ stream server on :{rx2_port} (complex64 @ '
+                  f'{rx.radio.wire_rate:.0f} Hz)')
 
     try:
         if args.seconds:
