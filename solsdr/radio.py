@@ -124,7 +124,8 @@ class Radio:
 
     def _log(self, *a):
         if self.verbose:
-            print('[radio]', *a)
+            from .log import log_line
+            log_line('radio', ' '.join(str(x) for x in a))
 
     def _set_state(self, state):
         if state != self.state:
@@ -210,7 +211,16 @@ class Radio:
 
     # -- tuning ------------------------------------------------------------
     def set_frequency(self, freq_hz: int, rx: int = 0) -> bool:
-        """Tune a receiver. rx=0 (RX1, default) or rx=1 (RX2, if enabled)."""
+        """Tune a receiver. rx=0 (RX1, default) or rx=1 (RX2, if enabled).
+
+        Rejects frequencies outside the profile's coverage
+        (freq_min_hz..freq_max_hz) with a warning and no wire command, rather
+        than silently sending an out-of-range tune."""
+        lo, hi = self.profile.freq_min_hz, self.profile.freq_max_hz
+        if not (lo <= freq_hz <= hi):
+            self._log(f'freq {freq_hz/1e6:.4f} MHz out of range '
+                      f'({lo/1e6:.3f}-{hi/1e6:.1f} MHz) — ignored')
+            return False
         if rx == 0:
             self._last_freq = freq_hz
         else:
@@ -263,6 +273,17 @@ class Radio:
             ok = self.ctrl.set_vhf_lna(on)
         if ok:
             self._log(f'VHF.LNA: {"on" if on else "off"}')
+        return ok
+
+    def set_preamp(self, state) -> bool:
+        """RX preamp/attenuator — 0x05 ('-20'/'-10'/'0'/'+10', or 'off'/'preamp',
+        or a raw byte 0x80-0x83). NOTE: shares 0x05 with the VHF LNA."""
+        if not self.ctrl:
+            return False
+        with self._ctrl_lock:
+            ok = self.ctrl.set_preamp(state)
+        if ok:
+            self._log(f'preamp/att -> {state}')
         return ok
 
     def set_mic_source(self, source) -> bool:
@@ -479,7 +500,10 @@ class Radio:
                         pass  # RX loop handles reconnection
             time.sleep(0.3)
 
-    def close(self):
+    def close(self, power_off: bool = False):
+        """Stop streaming and release resources. If power_off=True, send the
+        radio a POWER_OFF (0x02) first so it's left in a defined state (the next
+        open() re-wakes/re-inits it). Default False: leave the radio powered."""
         self._running = False
         self._set_state(STATE_DISCONNECTED)
         for t in self._threads:
@@ -492,8 +516,11 @@ class Radio:
         with self._ctrl_lock:
             if self.ctrl:
                 try:
+                    if power_off:
+                        self.ctrl.power_off()
                     self.ctrl.close()
                 except OSError:
                     pass
         self._log(f'closed ({self.packets_received} IQ packets received, '
-                  f'{self.reconnect_count} reconnects)')
+                  f'{self.reconnect_count} reconnects)'
+                  + (' [radio powered off]' if power_off else ''))

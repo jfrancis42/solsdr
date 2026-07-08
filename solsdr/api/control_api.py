@@ -10,7 +10,13 @@ Protocol (case-insensitive commands, one per line):
     mode <USB|LSB|AM|FM|CW> -> OK mode=<mode>
     ptt <on|off|0|1>     -> OK ptt=<on|off>
     power <watts>        -> OK power=<watts>
-    status               -> OK freq=<hz> mode=<m> ptt=<on|off> power=<w> streaming=<0|1>
+    preamp <-20|-10|0|+10|off|preamp> -> OK preamp=<state>
+    rit <hz>             -> OK rit=<hz>   (0 = off)
+    squelch|sql <0-1>    -> OK squelch=<lvl>
+    agc <auto|on|off|fixed:GAIN> -> OK agc=<mode>
+    nr <0-1>             -> OK nr=<lvl>
+    smeter               -> OK smeter=<dBFS>
+    status               -> OK freq=<hz> mode=<m> ptt=<on|off> power=<w> streaming=<0|1> smeter=<dBFS>
     ping                 -> OK pong
     quit                 -> OK bye  (closes connection)
 
@@ -48,7 +54,7 @@ class ControlAPIServer:
 
     def _log(self, *a):
         if self.verbose:
-            print('[ctrl-api]', *a)
+            from ..log import log_line; log_line('ctrl-api', ' '.join(str(x) for x in a))
 
     def start(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -170,12 +176,57 @@ class ControlAPIServer:
                     return 'ERR power set failed'
                 self.state['power'] = watts
                 return f'OK power={watts:g}'
+            if cmd == 'preamp':
+                if not args:
+                    return 'ERR preamp requires <-20|-10|0|+10|off|preamp>'
+                if not hasattr(self.radio, 'set_preamp'):
+                    return 'ERR unsupported preamp'
+                ok = self.radio.set_preamp(args[0])
+                return f'OK preamp={args[0]}' if ok is not False else 'ERR preamp failed'
+            if cmd == 'rit':
+                if not args:
+                    return 'ERR rit requires <Hz> (0=off)'
+                if not hasattr(self.radio, 'set_rit'):
+                    return 'ERR unsupported rit'
+                hz = float(args[0])
+                self.radio.set_rit(hz)
+                return f'OK rit={hz:g}'
+            if cmd == 'squelch' or cmd == 'sql':
+                if not args:
+                    return 'ERR squelch requires <0-1>'
+                if not hasattr(self.radio, 'set_squelch'):
+                    return 'ERR unsupported squelch'
+                lvl = float(args[0])
+                self.radio.set_squelch(lvl)
+                return f'OK squelch={lvl:g}'
+            if cmd == 'agc':
+                if not args:
+                    return 'ERR agc requires <auto|on|off|fixed:GAIN>'
+                if not hasattr(self.radio, 'set_agc'):
+                    return 'ERR unsupported agc'
+                self.radio.set_agc(args[0])
+                return f'OK agc={args[0]}'
+            if cmd == 'nr':
+                if not args or not hasattr(self.radio, 'set_nr'):
+                    return 'ERR nr requires <0-1>' if not args else 'ERR unsupported nr'
+                self.radio.set_nr(float(args[0]))
+                return f'OK nr={float(args[0]):g}'
+            if cmd == 'smeter':
+                # Real RX signal level in dBFS. (Note: cannot be pushed over
+                # CAT — the dummy rigctld backend rejects L STRENGTH — so it's
+                # exposed here for solsdr's own clients.)
+                sm = getattr(self.radio, 's_meter', None)
+                if sm is None:
+                    return 'ERR unsupported smeter'
+                return f'OK smeter={float(sm):.1f}'
             if cmd == 'status':
                 s = self.state
                 streaming = int(getattr(self.radio, 'streaming', 0) or 0)
+                sm = getattr(self.radio, 's_meter', None)
+                sm_str = f' smeter={float(sm):.1f}' if sm is not None else ''
                 return (f'OK freq={s["freq"]} mode={s["mode"]} '
                         f'ptt={"on" if s["ptt"] else "off"} '
-                        f'power={s["power"]} streaming={streaming}')
+                        f'power={s["power"]} streaming={streaming}{sm_str}')
             return f'ERR unknown command: {cmd}'
         except ValueError as e:
             return f'ERR bad argument: {e}'

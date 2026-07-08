@@ -47,7 +47,7 @@ class RigctldPoller:
 
     def _log(self, msg):
         if self.verbose:
-            print(f'[rigctld] {msg}')
+            from ..log import log_line; log_line('rigctld', msg)
 
     # -- lifecycle --------------------------------------------------------
     def start(self):

@@ -44,7 +44,7 @@ class PulseAudioDevices:
 
     def _log(self, msg):
         if self.verbose:
-            print(f'[pulse] {msg}')
+            from ..log import log_line; log_line('pulse', msg)
 
     # -- lifecycle ---------------------------------------------------------
     def start(self):

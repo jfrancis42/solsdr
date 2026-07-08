@@ -59,7 +59,7 @@ class MockRadio:
     # -- logging -----------------------------------------------------------
     def _log(self, *a):
         if self.verbose:
-            print('[mock]', *a)
+            from .log import log_line; log_line('mock', ' '.join(str(x) for x in a))
 
     # -- lifecycle ---------------------------------------------------------
     def start(self):

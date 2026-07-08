@@ -97,7 +97,7 @@ class TXPacer:
 
     def _log(self, *a):
         if self.verbose:
-            print('[tx-pacer]', *a)
+            from ..log import log_line; log_line('tx-pacer', ' '.join(str(x) for x in a))
 
     def start(self):
         if not hasattr(os, 'timerfd_create'):

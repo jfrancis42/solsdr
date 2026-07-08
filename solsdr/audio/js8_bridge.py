@@ -56,7 +56,7 @@ class JS8AudioBridge:
 
     def _log(self, msg):
         if self.verbose:
-            print(f'[bridge] {msg}')
+            from ..log import log_line; log_line('bridge', msg)
 
     # -- RX path ----------------------------------------------------------
     def _on_iq(self, iq: np.ndarray):

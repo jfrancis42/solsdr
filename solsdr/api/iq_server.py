@@ -42,7 +42,7 @@ class IQStreamServer:
 
     def _log(self, *a):
         if self.verbose:
-            print('[iq-server]', *a)
+            from ..log import log_line; log_line('iq-server', ' '.join(str(x) for x in a))
 
     def start(self, rate=None, freq=None):
         if rate is not None:

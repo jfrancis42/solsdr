@@ -1,0 +1,37 @@
+# solsdr headless RX engine — CAT (rigctld) + raw IQ server, no interactive shell.
+#
+# Install:
+#   sudo cp systemd/solsdr-receiver.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now solsdr-receiver
+#
+# Edit User=, ExecStart=, and the frequency/flags for your station. Prefer a
+# config file at ~/.config/solsdr/config.* (or /etc/solsdr/config.conf via
+# --config) so this unit stays generic. See systemd/README.md.
+
+[Unit]
+Description=solsdr SunSDR2 PRO headless RX engine (CAT + IQ)
+Documentation=https://github.com/jfrancis42/solsdr
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jfrancis
+# The solsdr console entry point (installed by `pip install .`). If running from
+# a source checkout instead, use e.g.:
+#   ExecStart=/usr/bin/python3 /home/jfrancis/solsdr/solsdr_receiver.py --config /etc/solsdr/config.conf --hamlib --iq-server --seconds 0
+ExecStart=/usr/local/bin/solsdr --config /etc/solsdr/config.conf --hamlib --iq-server
+Restart=on-failure
+RestartSec=5
+# solsdr's TX pacer wants SCHED_FIFO; grant the capability without full root.
+AmbientCapabilities=CAP_SYS_NICE
+# Hardening (RX engine touches only the network + audio + ~/.config/solsdr).
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+# Allow reading the station config/calibration under the user's home.
+ReadWritePaths=/etc/solsdr
+
+[Install]
+WantedBy=multi-user.target

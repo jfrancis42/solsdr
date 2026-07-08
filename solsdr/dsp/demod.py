@@ -98,6 +98,11 @@ class Demodulator:
         self._fm_prev = 0.0 + 0.0j
         # CW BFO phase (radians), carried across blocks for continuity
         self._cw_phase = 0.0
+        # RIT (receiver incremental tuning): a baseband frequency shift in Hz
+        # applied to the input IQ before demod, so the RX passband moves without
+        # retuning the radio's DDC (TX, if any, is unaffected). 0 = off.
+        self.rit_hz = 0.0
+        self._rit_phase = 0.0
 
         # S-meter state (smoothed)
         self.smeter_dbfs = -120.0
@@ -127,6 +132,11 @@ class Demodulator:
         if bandwidth is not None:
             self.cw_bandwidth = float(bandwidth)
         self._design_filters()
+
+    def set_agc(self, mode):
+        """Set AGC mode at runtime: 'auto' (on for voice, off for CW/data),
+        'on', 'off' (linear), or 'fixed:<gain>'."""
+        self.agc_mode = str(mode)
 
     def set_mode(self, mode: str):
         self.mode = mode.upper()
@@ -167,9 +177,22 @@ class Demodulator:
             g = self.fixed_gain
         return np.clip(audio * g, -0.98, 0.98)
 
+    def set_rit(self, hz):
+        """Set the RIT offset in Hz (receiver incremental tuning). Positive
+        moves the passband up. 0 disables. Applied as a baseband IQ shift."""
+        self.rit_hz = float(hz)
+
     def process(self, iq: np.ndarray) -> np.ndarray:
         """Demodulate one block of IQ to float32 audio at audio_rate."""
         self._update_smeter(iq)
+        # RIT: shift the input passband by -rit_hz so a signal at +rit_hz lands
+        # where the demod expects it. Continuous phase across blocks (no click).
+        if self.rit_hz:
+            n = len(iq)
+            dphi = -2 * np.pi * self.rit_hz / self.wire_rate
+            ph = self._rit_phase + dphi * np.arange(n)
+            iq = iq * np.exp(1j * ph).astype(np.complex64)
+            self._rit_phase = float((self._rit_phase + dphi * n) % (2 * np.pi))
         m = self.mode
 
         if m == 'USB':
