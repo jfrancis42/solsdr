@@ -160,8 +160,34 @@ Verified by an on/off/on/off capture (byte 54 cycled `02`/`01`). This is the
 (So `0x1B`, which the DX‑derived reference calls RX2_ENABLE, is *not* RX2 on the
 PRO — it's HF.LPF; see §4.)
 
-Note: fully *using* RX2 also means handling a second IQ stream, which is a
-larger feature than flipping this byte.
+### The RX2 IQ stream (how the second receiver's samples arrive)
+
+Characterized 2026‑07‑08 on a real PRO (RX1 on busy 20 m FT8, RX2 on a dead
+band). Both receivers stream on the **same port 50002** — no second port — as
+**interleaved packets tagged in the RX IQ header**:
+
+- **byte 8 = active‑receiver count:** `01` when one receiver is running, `02`
+  when two. (Mirrors the STATE_SYNC byte‑54 enable — every IQ packet is stamped
+  with how many receivers are active.)
+- **byte 9 = receiver index:** `00` = RX1, `01` = RX2. **This is the
+  discriminator** for routing a packet to the right receiver.
+
+(For reference the full RX IQ header is: `[0]` magic `01`, `[1]` `ff`, `[2]`
+opcode `fe`, `[3]` `ff`, `[4:6]` payload length 1200 LE, `[6:8]` sequence,
+`[8]` count, `[9]` index.)
+
+How it was verified: with one receiver, 100 % of IQ packets carry byte8=`01`,
+byte9=`00`. Enabling RX2 doubled the radio→host packet rate and split it exactly
+50/50 into byte9 `00` and `01` (byte8 now `02`), with a shared per‑packet
+sequence counter and the two receivers alternating. Amplitude confirmed the
+index→receiver mapping: byte9=`00` tracked the busy FT8 band (peaks ~−95 dBm),
+byte9=`01` the empty band (~−115 dBm) — index 0's IQ magnitude ran consistently
+higher at every percentile.
+
+Implementation is therefore small: read byte 9, route to per‑receiver
+demod/consumers; enable via byte 54 = `0x02` (already coded); the keepalive echo
+likely needs to reflect the receiver count. The `0x1B`‑is‑HF.LPF vs. RX2
+confusion (§4) does not affect any of this — RX2 has no toggle opcode at all.
 
 ## 5. Other PRO facts we found differ from the reference
 
@@ -222,8 +248,16 @@ upstream TX implementation:
   capture showed `0x15` staying `00` while `0x1e`/`0x20` moved, so the PRO
   mapping differs. Needs a clean one‑selector‑at‑a‑time recapture — not pursued
   further yet.
-- **Fan / temperature threshold control** (ExpertSDR3 exposes a max‑temp + fan
-  setting; opcode not captured).
+- **Fan / temperature control — RESOLVED: nothing to send.** The fan is
+  regulated **entirely by the radio firmware.** The fan cycles on its own while
+  solsdr runs (solsdr sends no fan/temp command at all), so ExpertSDR3 is not
+  driving it over the wire. Confirmed by capture (2026‑07‑08): the installed
+  ExpertSDR3 only *displays* temperature and provides no control to set it — and
+  a control‑socket capture while attempting to change the setting showed **zero
+  directed host→radio commands.** (The operator recalled ExpertSDR2 allowing a
+  temperature set; if that existed it was removed/changed in v3.) Host temp is
+  read from the `0x1F` telemetry (§3). So there is no setpoint opcode to
+  reverse‑engineer or implement — the radio self‑regulates.
 - **Second IQ stream for RX2.** The RX2 *enable* selector is known (STATE_SYNC
   byte 54 — see §4b); actually *using* the second receiver additionally requires
   handling its IQ stream, which we haven't implemented.

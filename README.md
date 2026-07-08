@@ -94,7 +94,7 @@ on‑air by JS8Call through the audio bridge. See **Transmit** below.
 | RX IQ streaming @ 39062.5 Hz + bidirectional keepalive | ✅ verified |
 | Selectable IQ rate 39062.5 / 78125 / 156250 / 312500 Hz | ✅ verified (FT8 decoded at 312.5 kHz) |
 | External 10 MHz reference (GPSDO) on/off | ✅ opcode verified (bytes identical to ExpertSDR3) |
-| Supply telemetry: voltage / current / temperature / forward‑power | ✅ `0x1F` fully decoded; shown in status (V/A, °F). Includes a forward‑power field (`fwd_power_raw`). No SWR is reported by the radio |
+| Supply telemetry: voltage / current / temperature / forward‑power | ✅ `0x1F` fully decoded; shown in status (V/A, °F). Includes a forward‑power field (`fwd_power_raw`). No SWR is reported by the radio. Temperature is read‑only — the radio runs its own fan in firmware (no host setpoint) |
 | Front-end: HF.LPF, VHF.LNA toggles | ✅ opcodes verified (relay‑confirmed); `lpf`/`lna` shell cmds |
 | Mic source (Mic1/Mic2/PC) | ✅ verified (`0x21`); `mic` shell cmd. Mic gain is client‑side (no radio cmd) |
 | USB / LSB / AM / FM / CW demodulation + S‑meter | ✅ verified |
