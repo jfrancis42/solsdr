@@ -184,6 +184,12 @@ def parse_telemetry(buf: bytes, magic: int = MAGIC_PRO):
         offset 16: uint16  supply voltage, /10   -> volts
         offset 18: float32 temperature (deg C)
 
+    The temperature field is read-only: the radio regulates its own fan
+    autonomously in firmware (the fan cycles under solsdr, which sends no
+    fan/temp command; a 2026-07-08 capture confirmed no host->radio fan/temp
+    setpoint command exists in ExpertSDR3). There is nothing to send — just read
+    temp_c/temp_f for display.
+
     Offsets 8/10/12 fully characterised 2026-07-07 via a keyed drive sweep into
     a dummy load (tools/tx_telem_probe.py):
       * offset 8  = forward-power indicator: exactly 0 during RX, monotonic with
