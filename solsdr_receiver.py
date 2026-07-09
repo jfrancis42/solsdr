@@ -386,9 +386,15 @@ def main():
                     help='port for the rigctld launched by --hamlib (default 4532)')
     ap.add_argument('--control-api', action='store_true',
                     help='also run the text control API on :5556')
-    ap.add_argument('--iq-server', action='store_true',
-                    help='also stream raw complex64 IQ to TCP clients on :5555 '
-                         '(GNU Radio TCP source, recorders, etc.)')
+    # RX IQ streaming is ON BY DEFAULT — the panadapter, GNU Radio, recorders,
+    # etc. all consume it, so binding the port is the normal case. Use
+    # --no-iq-server to disable it (e.g. to free the port or reduce load).
+    ap.add_argument('--iq-server', dest='iq_server', action='store_true',
+                    default=True,
+                    help='stream raw complex64 IQ to TCP clients on :5555 '
+                         '(default: ON; GNU Radio / panadapter / recorders)')
+    ap.add_argument('--no-iq-server', dest='iq_server', action='store_false',
+                    help='disable the RX IQ server (it is on by default)')
     ap.add_argument('--iq-port', type=int, default=5555)
     ap.add_argument('--iq-tx-server', action='store_true',
                     help='accept raw complex64 IQ from a TCP client and TRANSMIT '

@@ -134,6 +134,27 @@ on‑air by JS8Call through the audio bridge. See **Transmit** below.
 - **SunSDR2 DX** — profile is coded from ArtemisSDR but unverified on hardware.
 - **CW transmit** — not built (the encoder exists).
 
+**Expected features not yet built** (a user would reasonably want these):
+
+- **Access control / `--bind`** — the RX IQ server binds all interfaces with no
+  authentication, and the control + IQ‑TX servers have no auth (they default to
+  loopback). Since solsdr can transmit — including out of band — exposing these
+  on a network without a token check or a deliberate bind address is a real risk.
+  This is the top item to address before running solsdr exposed.
+- **Band‑plan / band‑edge awareness** — solsdr tunes and keys out of band
+  silently; expect at least a warning outside amateur allocations.
+- **Spectrum / panadapter feed** — solsdr serves raw IQ, but not a ready
+  band‑scope (periodic FFT bins) that a thin remote display could consume without
+  its own DSP. The most on‑brand missing feature for a no‑GUI SDR.
+- **Split / VFO‑A‑B transmit** — RX2 is dual‑*watch* only; no "TX here, RX there".
+- **Memory channels / presets** — the config file holds one default; no stored
+  recallable list of favorite frequencies/modes.
+- **Scanning** — no scan‑a‑range or scan‑memories‑stop‑on‑signal.
+- **Decoder output over the network** — the CW decoder prints to the shell but
+  isn't exposed on the control API for remote clients.
+- **Built‑in recording** — one‑shot IQ capture exists as a tool, but there's no
+  scheduled / triggered / rotating‑buffer recording as a server capability.
+
 ---
 
 ## Install
@@ -246,31 +267,35 @@ solsdr 7185 --mode LSB --device 5
 # Point at a specific radio / interface (overrides the config file)
 solsdr 14074 --radio-ip 10.1.2.3 --local-ip 10.1.2.185
 
+# The RX IQ server is ON BY DEFAULT (:5555) — GNU Radio / panadapter / recorders
+# can connect straight away. Just tune:
+solsdr 14074
+
 # Expose CAT to WSJT-X / fldigi / JS8Call (real rigctld on :4532)
 solsdr 14074 --hamlib
 
-# Stream raw IQ to GNU Radio (complex64 on tcp :5555)
-solsdr 14074 --iq-server
+# Disable the RX IQ server if you need the port free / to reduce load
+solsdr 14074 --no-iq-server
 
 # Accept raw IQ from GNU Radio and TRANSMIT it (tcp :5558). No RF without --tx-arm.
 solsdr 14074 --iq-tx-server                        # wiring test, no RF
 solsdr 14074 --iq-tx-server --tx-arm --max-power-watts 5 --tx-watts 3
 
-# Everything at once: CAT + IQ + text control API, wider 312.5 kHz IQ
-solsdr 14074 --hamlib --iq-server --control-api --rate 312500
+# Everything at once: CAT + IQ (default) + text control API, wider 312.5 kHz IQ
+solsdr 14074 --hamlib --control-api --rate 312500
 
 # Dual-watch: RX1 20 m (audio + IQ :5555), RX2 40 m CW (IQ :5557)
-solsdr 14074 --rx2 7025 --rx2-mode CW --iq-server
+solsdr 14074 --rx2 7025 --rx2-mode CW
 
 # External 10 MHz reference (GPSDO) on / off
 solsdr 14074 --ext-ref
 solsdr 14074 --no-ext-ref
 
 # Headless for a fixed time then exit (no prompt) — scripting/capture
-solsdr 14074 --iq-server --seconds 60
+solsdr 14074 --seconds 60
 
 # Move the CAT or IQ ports
-solsdr 14074 --hamlib --hamlib-port 4540 --iq-server --iq-port 5560
+solsdr 14074 --hamlib --hamlib-port 4540 --iq-port 5560
 
 # SunSDR2 DX (UNVERIFIED profile) and quieter logging
 solsdr 14074 --variant DX --log-level warning
@@ -284,6 +309,47 @@ solsdr --version
 
 ---
 
+## Panadapter (live spectrum + waterfall)
+
+`clients/panadapter.py` is a standalone, visually-nice panadapter that reads the
+RX IQ stream (and, optionally, the control API for live radio state). Pure
+Python — PyQt5/PyQt6/PySide6 + pyqtgraph + numpy — no GNU Radio, no ExpertSDR3.
+**Display only:** it never tunes or keys the radio.
+
+```bash
+# on the radio host (RX IQ is on by default; add --control-api for the info bar):
+solsdr 14074 --control-api
+
+# then, anywhere that can reach it (needs a display; ssh -X for remote):
+python3 clients/panadapter.py --host 127.0.0.1
+
+# no radio? replay a recorded capture (loops for a hands-off demo):
+python3 clients/panadapter.py --file clients/examples/solsdr_20m_demo30.iq
+```
+
+Features: FFT spectrum over a scrolling waterfall on a shared absolute-frequency
+axis; frequency across the bottom (MHz) and level up the side (dBFS, or dBm via
+`--ref-offset`); auto-scale or fixed ref/range; auto-adapts to solsdr's sample
+rate + center and follows retunes; perceptual colormaps for strong signal/noise
+contrast; live mouse crosshair readout (freq + level); an info bar with tuned
+freq, mode, PTT, TX power, S-meter, span, and RBW; a draggable splitter to trade
+spectrum vs. waterfall height; averaging, peak-hold, DC-spike hide, FFT size, and
+freeze. Keys: `A` auto-scale, `R` rescale now, `P` peak-hold, `C` cycle colormap,
+`space` freeze, `Q` quit. Run `python3 clients/panadapter.py --help` for options.
+
+> Performance: it's tuned to hit 30 fps+ on a **CPU-only** box. The two costs
+> that matter in software rendering are re-ranging the axis and an antialiased
+> filled trace — so auto-scale recomputes the range only every few seconds
+> (`--rescale SEC`, default 5; press `R` to snap now) and the trace is a thin
+> non-antialiased line by default. On a GPU/fast machine, `--pretty` restores a
+> filled antialiased trace.
+
+> Absolute power: solsdr RX isn't power-calibrated, so the axis is **dBFS** by
+> default. If you've measured your front-end offset, `--ref-offset <dB>` relabels
+> it as approximate dBm.
+
+---
+
 ## GNU Radio — IQ in and out
 
 solsdr exposes the radio to GNU Radio (or any SDR tooling) two ways: **raw IQ
@@ -291,10 +357,10 @@ over TCP** for receive, and **audio into the digital‑mode bridge** for transmi
 
 ### Receiving IQ (radio → GNU Radio)
 
-Start the IQ server and connect a **TCP source**:
+The RX IQ server is on by default, so just tune and connect a **TCP source**:
 
 ```bash
-solsdr 14074 --iq-server --rate 312500        # complex64 IQ on tcp 0.0.0.0:5555
+solsdr 14074 --rate 312500        # complex64 IQ on tcp 0.0.0.0:5555 (on by default)
 ```
 
 On the first connect, solsdr sends one newline‑terminated text header, then a
@@ -326,9 +392,11 @@ coherent two‑channel work (see [phase coherence](#second-receiver-rx2--dual-wa
 
 ### Transmitting IQ from GNU Radio (GNU Radio → radio)
 
-The **raw‑IQ TX server** is the transmit counterpart of `--iq-server`: it accepts
-raw `complex64` baseband IQ over TCP and streams it to the radio verbatim (gain +
-clip only — no modulation, no resampling), so your flowgraph *is* the modulator.
+The **raw‑IQ TX server** is the transmit counterpart of the RX IQ server: it
+accepts raw `complex64` baseband IQ over TCP and streams it to the radio verbatim
+(gain + clip only — no modulation, no resampling), so your flowgraph *is* the
+modulator. Unlike the RX server it is **opt‑in** (`--iq-tx-server`) — transmit is
+always a deliberate act.
 
 ```bash
 # Raw-IQ TX. Off (no RF) unless you add --tx-arm. Always into a dummy load first.
@@ -351,8 +419,8 @@ Then in GNU Radio Companion, end your TX chain in a **TCP Sink** (or
    PTT step is needed — connecting *is* keying.
 
 So a full baseband‑to‑RF SSB/data waveform you build in GNU Radio goes straight
-out the antenna, and RX (`--iq-server`, :5555) + TX (`--iq-tx-server`, :5558) give
-you a symmetric complex‑IQ pipe in and out of the radio.
+out the antenna, and RX (:5555, on by default) + TX (`--iq-tx-server`, :5558)
+give you a symmetric complex‑IQ pipe in and out of the radio.
 
 **Alternative — audio bridge:** for JS8Call/WSJT‑X/fldigi (or any app that emits
 *audio*, not IQ), use the bridge instead, which runs the audio through solsdr's
@@ -376,8 +444,8 @@ The PRO's second receiver runs alongside the first with an independent frequency
 and mode — e.g. watch 20 m and 40 m at once:
 
 ```bash
-python3 solsdr_receiver.py 14074 --rx2 7074 --iq-server
-#   RX1 -> audio + IQ on :5555   |   RX2 -> IQ on :5557
+python3 solsdr_receiver.py 14074 --rx2 7074
+#   RX1 -> audio + IQ on :5555   |   RX2 -> IQ on :5557  (both on by default)
 #   --rx2-mode CW / --rx2-device N  set RX2's mode / audio output
 ```
 
