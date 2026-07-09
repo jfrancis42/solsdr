@@ -4,8 +4,8 @@ The SunSDR2 SDR streams raw complex64 IQ over TCP so external tools consume it
 as network clients. **The RX IQ server is on by default** — just start solsdr:
 
 ```bash
-python3 solsdr_receiver.py 14074                     # IQ on tcp :5555 (default)
-python3 solsdr_receiver.py 14074 --no-iq-server      # ...or turn it off
+python3 -m solsdr 14074                     # IQ on tcp :5555 (default)
+python3 -m solsdr 14074 --no-iq-server      # ...or turn it off
 ```
 
 On connect the server sends one text line, then a continuous stream of
@@ -31,7 +31,7 @@ freq/mode/PTT/S-meter in an info bar.
 
 ```bash
 # radio host (IQ on by default; add --control-api for the info bar):
-python3 solsdr_receiver.py 14074 --control-api
+python3 -m solsdr 14074 --control-api
 # viewer (needs a display; ssh -X for remote):
 python3 clients/panadapter.py --host 127.0.0.1
 ```

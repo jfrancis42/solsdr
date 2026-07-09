@@ -16,7 +16,7 @@ INI-style/flat file (`.conf`/`.ini`/`.cfg` — no sections needed). Example
     freq_khz   = 14074
     mode       = USB
 
-Keys mirror the argparse dest names in solsdr_receiver.py. Unknown keys are
+Keys mirror the argparse dest names in solsdr.cli. Unknown keys are
 ignored (with a warning) so a config can carry extras.
 """
 import json
@@ -58,6 +58,15 @@ def _coerce(v):
     return v
 
 
+def config_path():
+    """Path of the existing config file, or the default JSON path to create."""
+    for c in _CANDIDATES:
+        p = os.path.join(CONFIG_DIR, c)
+        if os.path.exists(p):
+            return p
+    return os.path.join(CONFIG_DIR, 'config.json')
+
+
 def load(path=None):
     """Return a dict of config keys, or {} if no config file. If `path` is
     given, load exactly that file; otherwise search the standard location."""
@@ -78,3 +87,27 @@ def load(path=None):
             print(f'[config] failed to read {p}: {e}')
             return {}
     return {}
+
+
+def update(changes, path=None):
+    """Merge `changes` into the existing config and persist it. Returns the
+    written path. Preserves keys already present; used by the shell's `tx`
+    settings so the TX paths (`solsdr.audio`, the IQ-TX server) pick them up.
+
+    Flat (`key = value`) files are preserved as flat; everything else (and new
+    files) is written as JSON so values keep their types."""
+    p = path or config_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    current = load(p) if os.path.exists(p) else {}
+    current.update({k: v for k, v in changes.items() if v is not None})
+    if p.endswith('.json'):
+        with open(p, 'w') as f:
+            json.dump(current, f, indent=2, sort_keys=True)
+            f.write('\n')
+    else:
+        # rewrite the flat file, keeping it human-editable
+        with open(p, 'w') as f:
+            f.write('# solsdr config (managed; hand-editable)\n')
+            for k in sorted(current):
+                f.write(f'{k} = {current[k]}\n')
+    return p

@@ -49,10 +49,17 @@ class JS8AudioBridge:
         self.demod = Demodulator(wire_rate=radio.wire_rate,
                                  audio_rate=audio_rate, mode=tx_mode, agc='off')
 
+        self.mic_gain = 1.0        # TX-audio gain multiplier, live-adjustable
+        # CW send settings (shell `cw <text>`). char_wpm = element speed;
+        # word_wpm = Farnsworth spacing speed (defaults to char_wpm = standard).
+        self.cw_char_wpm = 20.0
+        self.cw_word_wpm = None    # None => standard (word == char)
+        self.cw_tone_hz = 600.0
         self._tx = None            # active TXSession while keyed
         self._tx_lock = threading.Lock()
         self._keyed = False
         self._running = False
+        self._external_iq = False  # True => fed by feed_iq(), not own start_stream
 
     def _log(self, msg):
         if self.verbose:
@@ -100,6 +107,7 @@ class JS8AudioBridge:
             time.sleep(0.005)
             waited += 0.005
         if first is not None:
+            first = self._apply_mic_gain(first)
             self.monitor.play(first)
             yield first
 
@@ -110,8 +118,18 @@ class JS8AudioBridge:
                 yield silence
                 time.sleep(0.005)
             else:
+                chunk = self._apply_mic_gain(chunk)
                 self.monitor.play(chunk)
                 yield chunk
+
+    def _apply_mic_gain(self, block):
+        """Scale TX audio by the live mic-gain multiplier (1.0 = unity). Clip to
+        [-1, 1] so a high gain can't overflow the modulator's input leveling.
+        Read fresh each block so gain changes apply live during an over."""
+        g = self.mic_gain
+        if g == 1.0:
+            return block
+        return np.clip(block * g, -1.0, 1.0).astype(np.float32)
 
     def set_ptt(self, on: bool):
         """PTT edge from the Hamlib client. Key/unkey a TXSession around the
@@ -121,6 +139,148 @@ class JS8AudioBridge:
                 self._key()
             elif not on and self._keyed:
                 self._unkey()
+
+    # -- live TX-setting control (used by the unified shell) ----------------
+    def is_keyed(self):
+        return self._keyed
+
+    def set_tx_watts(self, watts):
+        """Set the TX output setpoint. Applies to a live (keyed) transmission
+        immediately via the active TXSession, and to subsequent overs. `watts`
+        is clamped to max_power_watts by the TXSession regardless."""
+        self.tx_watts = float(watts) if watts is not None else None
+        with self._tx_lock:
+            if self._tx is not None and self.tx_watts is not None:
+                self._tx.set_power_watts(self.tx_watts)   # live drive change
+
+    def set_mic_gain(self, g):
+        """Set the TX-audio (mic) gain multiplier; takes effect on the next
+        audio block, so it applies live during a transmission."""
+        self.mic_gain = max(0.0, float(g))
+
+    def tune_carrier(self, seconds=3.0, watts=None, tone_hz=1000.0):
+        """Key a steady CW tuning carrier for `seconds`, then unkey.
+
+        The ONE case where solsdr itself keys the transmitter (everything else
+        is app/CAT-driven PTT): a deliberate, time-bounded tuning key-up. Uses
+        the same interlocked TXSession as normal TX (arm, amp-limit clamp,
+        calibration gate, dead-man). Refuses if a transmission is already in
+        progress. `watts` defaults to the current TX setpoint (self.tx_watts).
+        Returns (ok, message). Blocking for the duration.
+        """
+        import threading
+        import numpy as np
+        with self._tx_lock:
+            if self._keyed:
+                return False, 'already transmitting — tune refused'
+            self._keyed = True
+        try:
+            from ..tx_session import TXSession
+            w = self.tx_watts if watts is None else float(watts)
+            mode = 'USB'                    # a tone in USB = a clean carrier offset
+            stop = threading.Event()
+
+            def tone_iter():
+                block = self.audio_rate // 50
+                ph = 0.0
+                dphi = 2 * np.pi * tone_hz / self.audio_rate
+                while not stop.is_set():
+                    idx = np.arange(block)
+                    blk = (0.9 * np.sin(ph + dphi * idx)).astype(np.float32)
+                    ph = (ph + dphi * block) % (2 * np.pi)
+                    yield self._apply_mic_gain(blk)
+
+            tx = TXSession(self.radio, mode=mode, audio_rate=self.audio_rate,
+                           max_drive=self.max_drive,
+                           max_power_watts=self.max_power_watts,
+                           deadman_s=max(seconds + 2, 5), verbose=self.verbose)
+            permitted, reason = tx.tx_permitted()
+            if not permitted:
+                return False, f'tune refused: {reason}'
+            tx.arm(confirm=True)
+            self._tx = tx
+            tx.enter_tx(tone_iter(), watts=w, pa=False, prebuffer_s=0.1)
+            self._log(f'*** TUNE carrier: {seconds:g}s @ '
+                      f'{("%.1f W" % w) if w is not None else "full drive"} ***')
+            import time as _t
+            _t.sleep(float(seconds))
+            stop.set()
+            tx.exit_tx()
+            return True, (f'tune complete: {seconds:g}s @ '
+                          f'{("%.1f W" % w) if w is not None else "full drive"}')
+        finally:
+            self._tx = None
+            self._keyed = False
+
+    def send_cw(self, text, watts=None):
+        """Encode `text` to Morse (at the configured char/word WPM + tone) and
+        transmit it, then unkey. Farnsworth timing honored (word_wpm < char_wpm).
+        Uses the interlocked TXSession like tune/normal TX. Refuses if already
+        keyed. Blocks until the message is sent. Returns (ok, message)."""
+        import threading
+        import numpy as np
+        from ..dsp.cw_decode import CWEncoder
+        text = text.strip()
+        if not text:
+            return False, 'nothing to send'
+        with self._tx_lock:
+            if self._keyed:
+                return False, 'already transmitting — cw send refused'
+            self._keyed = True
+        try:
+            enc = CWEncoder(sample_rate=self.audio_rate, pitch=self.cw_tone_hz,
+                            char_wpm=self.cw_char_wpm, word_wpm=self.cw_word_wpm)
+            audio = enc.encode(text).astype(np.float32)
+            if len(audio) == 0:
+                return False, 'no sendable characters in message'
+
+            # One-shot iterator: yield the encoded audio in modulator-sized
+            # blocks, then a little trailing silence, then stop (ends the over).
+            block = self.audio_rate // 50
+            def cw_iter():
+                for i in range(0, len(audio), block):
+                    yield self._apply_mic_gain(audio[i:i + block])
+                for _ in range(3):          # ~60 ms tail so the last dit clears
+                    yield np.zeros(block, dtype=np.float32)
+
+            from ..tx_session import TXSession
+            w = self.tx_watts if watts is None else float(watts)
+            tx = TXSession(self.radio, mode='USB', audio_rate=self.audio_rate,
+                           max_drive=self.max_drive,
+                           max_power_watts=self.max_power_watts,
+                           deadman_s=max(len(audio) / self.audio_rate + 5, 10),
+                           verbose=self.verbose)
+            permitted, reason = tx.tx_permitted()
+            if not permitted:
+                return False, f'cw send refused: {reason}'
+            tx.arm(confirm=True)
+            self._tx = tx
+            dur = len(audio) / self.audio_rate
+            eff = self.cw_word_wpm or self.cw_char_wpm
+            self._log(f'*** CW TX: {len(text)} chars, ~{dur:.1f}s @ '
+                      f'{self.cw_char_wpm:g}wpm'
+                      f'{"/%gwpm Farnsworth" % self.cw_word_wpm if self.cw_word_wpm and self.cw_word_wpm < self.cw_char_wpm else ""} ***')
+            tx.enter_tx(cw_iter(), watts=w, pa=False, prebuffer_s=0.1)
+            # Wait for the whole message (plus a margin) to pace out, then unkey.
+            import time as _t
+            _t.sleep(dur + 0.5)
+            tx.exit_tx()
+            return True, (f'sent {len(text)} chars in ~{dur:.1f}s '
+                          f'({self.cw_char_wpm:g}/{eff:g} wpm, {self.cw_tone_hz:g} Hz)')
+        finally:
+            self._tx = None
+            self._keyed = False
+
+    def set_cw(self, char_wpm=None, word_wpm=None, tone_hz=None):
+        """Set CW send parameters. char_wpm = element speed; word_wpm =
+        Farnsworth spacing speed (pass a value < char_wpm for Farnsworth, or
+        None/>=char for standard); tone_hz = sidetone/pitch (default 600)."""
+        if char_wpm is not None:
+            self.cw_char_wpm = float(char_wpm)
+        if word_wpm is not None:
+            self.cw_word_wpm = None if word_wpm in ('', None) else float(word_wpm)
+        if tone_hz is not None:
+            self.cw_tone_hz = float(tone_hz)
 
     def _key(self):
         # Import here so RX-only use doesn't require the TX stack.
@@ -157,16 +317,27 @@ class JS8AudioBridge:
         self._log('PTT OFF — TX unkeyed, RX resumed')
 
     # -- lifecycle --------------------------------------------------------
-    def start(self):
+    def start(self, external_iq=False):
+        """Start the bridge. If external_iq=True the caller feeds RX IQ via
+        feed_iq() (used by the unified transceiver, where the receiver owns the
+        single Radio.start_stream callback and fans IQ out to both consumers);
+        otherwise the bridge owns start_stream itself (standalone `solsdr.audio`)."""
         self.devices.start()
         self.monitor.start()
         # PTT is delivered by the rigctld poller calling bridge.set_ptt().
         # Keep the demod's sideband synced to the radio's mode on the fly (the
         # poller calls radio.set_mode when the app changes mode).
         self._install_mode_hook()
-        self.radio.start_stream(self._on_iq)
+        self._external_iq = external_iq
+        if not external_iq:
+            self.radio.start_stream(self._on_iq)
         self._running = True
-        self._log('audio bridge running')
+        self._log(f'audio bridge running{" (external IQ feed)" if external_iq else ""}')
+
+    def feed_iq(self, iq):
+        """Feed one RX IQ block to the bridge (external_iq mode). Safe to call
+        from the receiver's fan-out; the bridge ignores RX while keyed."""
+        self._on_iq(iq)
 
     def _install_mode_hook(self):
         """Wrap radio.set_mode so the demod follows mode changes made via

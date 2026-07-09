@@ -34,8 +34,8 @@ Issues = "https://github.com/jfrancis42/solsdr/issues"
 tools = ["matplotlib>=3.7"]
 
 [project.scripts]
-solsdr = "solsdr_receiver:main"
-solsdr-receiver = "solsdr_receiver:main"
+solsdr = "solsdr.cli:main"
+solsdr-shell = "solsdr.cli:main"
 
 [tool.setuptools]
 packages = [
@@ -45,4 +45,3 @@ packages = [
     "solsdr.api",
     "solsdr.audio",
 ]
-py-modules = ["solsdr_receiver"]

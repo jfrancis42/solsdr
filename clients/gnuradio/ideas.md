@@ -4,7 +4,7 @@ solsdr hands GNU Radio a clean complex64 IQ firehose — up to **312.5 kHz** of
 spectrum (~150 kHz usable) from the SunSDR2 PRO over TCP. GNU Radio is a DSP
 LEGO set on top of that. This is a categorized, annotated backlog.
 
-**The stream:** `solsdr_receiver.py <kHz> --iq-server` publishes little-endian
+**The stream:** `solsdr.cli <kHz> --iq-server` publishes little-endian
 interleaved float32 I,Q (numpy complex64) on TCP :5555, preceded by a one-line
 text header (`SOLSDR IQ rate=... fmt=complex64 freq=...`). `qt_iq_waterfall.py`
 in this directory shows the pattern for consuming it (the `_SolsdrTCPSource`
