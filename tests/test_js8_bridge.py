@@ -79,12 +79,12 @@ def test_bridge_rx_and_ptt():
     if not _pulse_available():
         print('SKIP: PulseAudio not available')
         return
-    from solsdr.audio.js8_bridge import JS8AudioBridge
+    from solsdr.audio.audio_bridge import AudioBridge
 
     radio = FakeRadio()
     # tiny max_drive; TXSession won't hit real hardware (fake radio has no
     # ctrl/rx_sock), but we exercise the key/unkey path & audio iterator.
-    bridge = JS8AudioBridge(radio, prefix='sstestbr', audio_rate=48000,
+    bridge = AudioBridge(radio, prefix='sstestbr', audio_rate=48000,
                             tx_mode='USB', verbose=False)
     bridge.start()
     try:

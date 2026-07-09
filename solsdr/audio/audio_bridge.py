@@ -25,7 +25,7 @@ from ..dsp.demod import Demodulator
 from .pulse_devices import PulseAudioDevices, SpeakerMonitor
 
 
-class JS8AudioBridge:
+class AudioBridge:
     def __init__(self, radio, prefix='solsdr', audio_rate=48000,
                  tx_mode='USB', max_drive=255, max_power_watts=None,
                  tx_watts=None, monitor_sink=None, monitor_gain=0.7,

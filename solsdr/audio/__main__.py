@@ -27,7 +27,7 @@ import threading
 import time
 
 from ..radio import Radio
-from .js8_bridge import JS8AudioBridge
+from .audio_bridge import AudioBridge
 from .rigctld_poller import RigctldPoller
 
 
@@ -100,7 +100,7 @@ def main():
                            capture_output=True, text=True)
         monitor_sink = r.stdout.strip() or None
 
-    bridge = JS8AudioBridge(radio, prefix=args.prefix,
+    bridge = AudioBridge(radio, prefix=args.prefix,
                             audio_rate=args.audio_rate, tx_mode=args.tx_mode,
                             max_drive=args.max_drive,
                             max_power_watts=args.max_power_watts,

@@ -704,7 +704,7 @@ solsdr/                   the Python package
                           interlocked (disarmed unless --tx-arm)
   audio/                  digital-mode bridge (python3 -m solsdr.audio)
     __main__.py           entry point: radio + real rigctld + virtual audio
-    js8_bridge.py         RX demod -> virtual sink; app audio -> modulator -> TX
+    audio_bridge.py       RX demod -> virtual sink; app audio -> modulator -> TX
     pulse_devices.py      PulseAudio null sinks + monitor-source remap
     rigctld_poller.py     launches real rigctld + mirrors freq/mode/PTT to the
                           radio — the shared CAT mechanism used by the receiver,

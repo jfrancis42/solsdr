@@ -796,9 +796,9 @@ def main():
     bridge_poller = None
     if args.tx:
         try:
-            from solsdr.audio.js8_bridge import JS8AudioBridge
+            from solsdr.audio.audio_bridge import AudioBridge
             from solsdr.audio.rigctld_poller import RigctldPoller
-            br = JS8AudioBridge(rx.radio, prefix=args.prefix, tx_mode=args.tx_mode,
+            br = AudioBridge(rx.radio, prefix=args.prefix, tx_mode=args.tx_mode,
                                 max_power_watts=args.max_power_watts,
                                 tx_watts=args.tx_watts, monitor_sink=args.monitor,
                                 verbose=False)
