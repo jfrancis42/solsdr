@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
 """
-solsdr panadapter — a live spectrum + waterfall display for the SunSDR2 PRO.
+solsdr panadapter + control panel for the SunSDR2 PRO.
 
 A standalone, visually-nice panadapter that reads solsdr's raw-IQ TCP stream
-(`python3 -m solsdr`, IQ server on port 5555, on by default) and, optionally, its
-text control API (port 5556) for live radio state. Pure Python: PyQt5 +
+(`python3 -m solsdr`, IQ server on port 5555, on by default) and its text
+control API (port 5556) for live radio state AND control. Pure Python: PyQt5 +
 pyqtgraph + numpy. No GNU Radio, no ExpertSDR3.
 
-DISPLAY ONLY — this tool never tunes, keys, or changes the radio. It shows you
-what's going on. (Control may come later.)
+CONTROL PANEL: it both displays and controls the radio — click-to-tune, a mode
+selector, and clickable frequency digits. Every control mirrors the radio's live
+state (polled from the control API), so changes made elsewhere (the shell, other
+clients) are reflected here, and vice-versa. Controls need solsdr's control API
+(on by default). Without it, the panadapter still works as a display.
 
 Features
 --------
+  * Radio control (needs the control API): click the spectrum/waterfall to tune,
+    a mode dropdown, and a clickable frequency dial (click a digit's top to step
+    that decade up, bottom to step down; a "0" button zeroes below the kHz
+    decimal). Every control mirrors the radio's live state.
+  * Filter passband overlay: a translucent region shows the RX filter (drag its
+    edges on the spectrum to set the passband; RF offsets from the dial), a solid
+    line marks the exact dial frequency, and mode-aware bandwidth presets (CW
+    200/400/600 Hz, SSB 2.4/2.7/3.0 kHz, + Custom) sit in the DSP row.
   * Live FFT spectrum (top) + scrolling waterfall (bottom), sharing one
     absolute-frequency x-axis so a peak sits directly over its waterfall trace.
   * Frequency across the bottom (MHz), amplitude up the side (dBFS, or dBm with
@@ -34,8 +45,8 @@ Features
 
 Usage
 -----
-    # live: on the machine running solsdr (RX IQ is on by default) —
-    python3 -m solsdr 14074 --control-api
+    # live: on the machine running solsdr (RX IQ + control API on by default) —
+    python3 -m solsdr 14074
 
     # then, anywhere that can reach it (needs a display; ssh -X for remote):
     python3 clients/panadapter.py --host 127.0.0.1
@@ -48,15 +59,18 @@ wire-format capture; loops at EOF), --fft, --ref-offset (dBFS→dBm), --rescale
 (auto-scale cadence, s), --pretty (antialiased filled trace), --no-control. Run
 with --help for all. Keys: +/- zoom (0 = full) · A auto-scale · R rescale now ·
 P peak-hold · C colormap · space freeze · Q quit. (Zoom +/- buttons are in the
-toolbar; mouse-drag/scroll on the plot also zooms/pans.)
+toolbar; mouse-drag/scroll on the plot also zooms/pans.) Left-click the
+spectrum/waterfall to tune the radio.
 
 Notes
 -----
   * solsdr RX has no absolute power calibration, so the axis is **dBFS** by
     default (0 dBFS = a full-scale complex tone). If you have measured the
     offset for your setup, pass --ref-offset <dB> to relabel the axis as dBm.
-  * solsdr's control API reports freq/mode/PTT/power/S-meter but NOT AGC / NR /
-    filter / preamp (those are set-only), so the info bar shows what's queryable.
+  * solsdr's control API reports freq/mode/PTT/power/S-meter AND the RX DSP /
+    front-end state (AGC, gain, RIT, NR, NB, notch, APF, squelch, preamp), so the
+    second-row controls mirror the live radio — changes made in the shell or
+    another client move the widgets here, and vice-versa.
 """
 import argparse
 import os
@@ -99,6 +113,17 @@ KEY_SPACE = _qt("Key", "Key_Space")
 KEY_C = _qt("Key", "Key_C")
 KEY_Q = _qt("Key", "Key_Q")
 KEY_ESCAPE = _qt("Key", "Key_Escape")
+
+# Modes the solsdr control API accepts (see api/control_api.py VALID_MODES).
+CONTROL_MODES = ["USB", "LSB", "AM", "FM", "CW"]
+
+
+def _qt_frameshape(member):
+    """QFrame.Shape.VLine (scoped) or QFrame.VLine (flat), binding-agnostic."""
+    scope = getattr(QtWidgets.QFrame, "Shape", None)
+    if scope is not None and hasattr(scope, member):
+        return getattr(scope, member)
+    return getattr(QtWidgets.QFrame, member)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -326,11 +351,14 @@ class FileIQReader(_RingReader):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Control API poller (background thread) — optional, display-only
+# Control API poller (background thread) — live radio state + control
 # ─────────────────────────────────────────────────────────────────────────────
 class ControlPoller(threading.Thread):
-    """Polls solsdr's text control API `status` for live radio state. Purely a
-    reader — never sends a control command. Reconnects on failure."""
+    """Polls solsdr's text control API `status` for live radio state. Reads on
+    its own thread; send_command() opens a SEPARATE short-lived connection so a
+    command (freq/mode/etc.) can't race the poll socket. The polled state is
+    what the on-screen controls mirror, so external changes (shell, other
+    clients) show up here and this panel's commands show up there."""
 
     def __init__(self, host, port, interval=0.5):
         super().__init__(daemon=True)
@@ -341,6 +369,18 @@ class ControlPoller(threading.Thread):
         self._lock = threading.Lock()
         self._state = {}
         self.available = False
+
+    def send_command(self, line, timeout=2.0):
+        """Send one control-API command over a fresh connection; return the
+        reply string (or None on failure). Used for click-to-tune."""
+        try:
+            with socket.create_connection((self.host, self.port),
+                                          timeout=timeout) as s:
+                s.settimeout(timeout)
+                s.sendall((line + "\n").encode("utf-8"))
+                return self._recv_line(s)
+        except OSError:
+            return None
 
     def run(self):
         sock = None
@@ -440,8 +480,8 @@ class SpectrumProc:
 # ─────────────────────────────────────────────────────────────────────────────
 # Colormaps
 # ─────────────────────────────────────────────────────────────────────────────
-CMAP_NAMES = ["inferno", "viridis", "magma", "plasma", "turbo", "CET-L9",
-              "cividis"]
+CMAP_NAMES = ["cividis", "inferno", "viridis", "magma", "plasma", "turbo",
+              "CET-L9"]
 
 
 def load_cmap(name):
@@ -458,15 +498,127 @@ def load_cmap(name):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Clickable frequency dial
+# ─────────────────────────────────────────────────────────────────────────────
+class _Digit(QtWidgets.QLabel):
+    """One frequency digit. Click the TOP half to increment that decade, the
+    BOTTOM half to decrement; the mouse wheel does the same. Emits `stepped(±weight)`
+    where weight is this digit's place value in Hz (e.g. 1000 for the kHz digit)."""
+
+    # pyqtgraph.Qt normalizes `Signal` onto QtCore for every binding.
+    stepped = QtCore.Signal(int)
+
+    def __init__(self, weight):
+        super().__init__("0")
+        self.weight = int(weight)
+        self.setAlignment(_qt("AlignmentFlag", "AlignCenter"))
+        # fixed-width so the number doesn't jitter as digits change
+        f = QtGui.QFont("monospace")
+        f.setPointSize(20)
+        f.setBold(True)
+        self.setFont(f)
+        self.setFixedWidth(20)
+        self.setStyleSheet("QLabel{color:#111;}"
+                           "QLabel:hover{color:#0a7; background:#e8f4f0;}")
+        self.setCursor(QtGui.QCursor(_qt("CursorShape", "PointingHandCursor")))
+        self.setToolTip(f"{self.weight:,} Hz — click top +1, bottom −1")
+
+    def _dir(self, y):
+        return +1 if y < self.height() / 2 else -1
+
+    def mousePressEvent(self, ev):
+        self.stepped.emit(self._dir(ev.pos().y()) * self.weight)
+
+    def wheelEvent(self, ev):
+        try:
+            dy = ev.angleDelta().y()
+        except AttributeError:
+            dy = ev.delta()
+        self.stepped.emit((1 if dy > 0 else -1) * self.weight)
+
+
+class FrequencyDial(QtWidgets.QWidget):
+    """A row of clickable per-decade digits showing the tuned frequency in Hz,
+    grouped MHz.kHz.Hz with separators, plus a "0" button that zeroes everything
+    below the kHz decimal (rounds to the nearest kHz). Click a digit's top to
+    step that decade up by one, bottom to step down. Emits `tuned(hz)` when the
+    operator changes it; call set_hz() to follow external state without emitting."""
+
+    tuned = QtCore.Signal(int)
+
+    # place weights from most to least significant, with '.' group separators.
+    # Covers up to 999 MHz (9 digits) — plenty for the SunSDR2's HF/VHF range.
+    _PLACES = [100_000_000, 10_000_000, 1_000_000, None,
+               100_000, 10_000, 1_000, None,
+               100, 10, 1]
+
+    def __init__(self):
+        super().__init__()
+        self._hz = 0
+        self._digits = {}                       # weight -> _Digit
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        for w in self._PLACES:
+            if w is None:
+                sep = QtWidgets.QLabel(".")
+                sep.setStyleSheet("QLabel{color:#888;}")
+                lay.addWidget(sep)
+                continue
+            d = _Digit(w)
+            d.stepped.connect(self._on_step)
+            self._digits[w] = d
+            lay.addWidget(d)
+        lay.addSpacing(4)
+        lay.addWidget(QtWidgets.QLabel(
+            "<span style='color:#888;font-size:11px'>Hz</span>"))
+        z = QtWidgets.QPushButton("0")
+        z.setFixedWidth(24)
+        z.setToolTip("Zero all digits below the kHz decimal "
+                     "(round to the nearest kHz)")
+        z.clicked.connect(self._zeroize)
+        lay.addSpacing(6)
+        lay.addWidget(z)
+
+    def _render(self):
+        # 9 digit places (the None entries are '.' separators, not digits).
+        s = f"{self._hz:09d}"
+        for ch, w in zip(s, [w for w in self._PLACES if w is not None]):
+            self._digits[w].setText(ch)
+
+    def set_hz(self, hz):
+        """Follow external state — updates the display WITHOUT emitting tuned()."""
+        hz = max(0, int(round(hz)))
+        if hz != self._hz:
+            self._hz = hz
+            self._render()
+
+    def _on_step(self, delta):
+        self._hz = max(0, self._hz + int(delta))
+        self._render()
+        self.tuned.emit(self._hz)
+
+    def _zeroize(self):
+        self._hz = int(round(self._hz / 1000.0)) * 1000
+        self._render()
+        self.tuned.emit(self._hz)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main window
 # ─────────────────────────────────────────────────────────────────────────────
 class Panadapter(QtWidgets.QMainWindow):
     def __init__(self, iq: IQReader, ctrl: ControlPoller, *,
-                 fft_size=2048, ref_offset=0.0, wf_history=400,
+                 fft_size=4096, ref_offset=0.0, wf_history=400,
                  update_ms=33, rescale_interval=5.0, pretty=False):
         super().__init__()
         self.iq = iq
         self.ctrl = ctrl
+        # Control is enabled whenever we have a control-API connection. A
+        # left-click on the spectrum/waterfall tunes the radio; the toolbar
+        # mode/frequency widgets command it too. All mirror the radio's live
+        # state via the poll, so shell/other-client changes show up here.
+        self.can_control = ctrl is not None and hasattr(ctrl, 'send_command')
         # "pretty" = antialiased, filled, thicker trace (nice on a GPU/fast box).
         # Default is "fast": no antialias, thin trace, no fill — the software
         # rasterizer spends ~50 ms/frame on AA+fill of a 2048-point curve, vs
@@ -482,6 +634,9 @@ class Panadapter(QtWidgets.QMainWindow):
         self.freeze = False
         self.peak_hold = False
         self.kill_dc = True
+        # mirror the display spectrum to put USB above (right of) the dial — see
+        # the conjugation note in _tick. Default on for the SunSDR2 wire format.
+        self.spectrum_invert = True
         self.ref_level = -20.0            # fixed-mode top of scale (display units)
         self.dyn_range = 90.0             # fixed-mode span in dB
         self._auto_min = -120.0
@@ -499,7 +654,7 @@ class Panadapter(QtWidgets.QMainWindow):
         # frame — the per-frame setYRange repaint is the main CPU cost.
         self.rescale_interval = float(rescale_interval)
         self._last_rescale = 0.0
-        self.cmap_name = "inferno"
+        self.cmap_name = "cividis"
 
         # axis geometry (updated live)
         self.center_hz = iq.header_freq or 0.0
@@ -526,11 +681,13 @@ class Panadapter(QtWidgets.QMainWindow):
         vbox.setSpacing(4)
 
         vbox.addLayout(self._build_controls())
+        if self.can_control:
+            vbox.addLayout(self._build_dsp_controls())
 
         # info bar
         self.info = QtWidgets.QLabel("—")
         self.info.setTextFormat(RICHTEXT)
-        self.info.setStyleSheet("QLabel{color:#dfe6ee;font-size:12px;"
+        self.info.setStyleSheet("QLabel{color:#000000;font-size:12px;"
                                 "padding:2px 4px;}")
         vbox.addWidget(self.info)
 
@@ -590,8 +747,49 @@ class Panadapter(QtWidgets.QMainWindow):
         self.p_spec.addItem(self.vline, ignoreBounds=True)
         self.p_spec.addItem(self.hline, ignoreBounds=True)
         self.p_wf.addItem(self.vline_wf, ignoreBounds=True)
+
+        # -- filter passband overlay + dial-frequency line --
+        # A translucent region shows the receive filter passband (dial+lo ..
+        # dial+hi). It's draggable on the SPECTRUM (edges send `filter <lo> <hi>`
+        # as RF offsets) and mirrored, non-interactive, on the waterfall. A solid
+        # vertical line marks the exact dial (tuned) frequency on both.
+        self._filter_lo_hz = None          # RF offsets from dial (Hz); None until known
+        self._filter_hi_hz = None
+        self._filter_syncing = False       # guard: setRegion shouldn't send a command
+        # translucent fill + solid bright edges so it reads even over a dark,
+        # near-empty spectrum. Edges are grab handles on the spectrum.
+        fbrush = pg.mkBrush(90, 205, 255, 60)
+        fedge = pg.mkPen(120, 220, 255, 220, width=2)
+        fhover = pg.mkPen(180, 240, 255, 255, width=3)
+        self.filter_region = pg.LinearRegionItem(
+            values=(0, 1), brush=fbrush, pen=fedge, hoverPen=fhover,
+            movable=self.can_control)
+        self.filter_region.setZValue(-20)
+        self.filter_region_wf = pg.LinearRegionItem(
+            values=(0, 1), brush=fbrush, pen=fedge, movable=False)
+        self.filter_region_wf.setZValue(10)
+        dialpen = pg.mkPen("#ffd21c", width=1.2)
+        self.dial_line = pg.InfiniteLine(angle=90, movable=False, pen=dialpen)
+        self.dial_line_wf = pg.InfiniteLine(angle=90, movable=False, pen=dialpen)
+        # hidden until the control API reports a real passband (filter_lo/hi);
+        # otherwise a stray band would sit at 0 Hz in display-only mode.
+        self.filter_region.setVisible(False)
+        self.filter_region_wf.setVisible(False)
+        self.p_spec.addItem(self.filter_region, ignoreBounds=True)
+        self.p_spec.addItem(self.dial_line, ignoreBounds=True)
+        self.p_wf.addItem(self.filter_region_wf, ignoreBounds=True)
+        self.p_wf.addItem(self.dial_line_wf, ignoreBounds=True)
+        if self.can_control:
+            self.filter_region.sigRegionChangeFinished.connect(
+                self._on_filter_drag)
         self._mouse_proxy = pg.SignalProxy(self.p_spec.scene().sigMouseMoved,
                                            rateLimit=60, slot=self._on_mouse)
+        # Click-to-tune: send the radio to the frequency under the click (on the
+        # spectrum and waterfall, which share the x-axis). Enabled when we can
+        # control the radio.
+        if self.can_control:
+            self.p_spec.scene().sigMouseClicked.connect(self._on_click)
+            self.p_wf.scene().sigMouseClicked.connect(self._on_click)
 
         # cursor readout
         self.cursor_lbl = QtWidgets.QLabel("cursor: —")
@@ -601,6 +799,30 @@ class Panadapter(QtWidgets.QMainWindow):
     def _build_controls(self):
         row = QtWidgets.QHBoxLayout()
         row.setSpacing(8)
+
+        # --- radio control: mode + clickable frequency dial ---
+        # Present only when we can reach the control API; otherwise this is a
+        # display and there's nothing to command. Both widgets mirror the live
+        # polled state (see _sync_controls) so shell/other-client changes show.
+        self.cmb_mode = None
+        self.freq_dial = None
+        if self.can_control:
+            self.cmb_mode = QtWidgets.QComboBox()
+            self.cmb_mode.addItems(CONTROL_MODES)
+            self.cmb_mode.setToolTip("Radio mode (mirrors the radio; changing it "
+                                     "commands the radio)")
+            self.cmb_mode.activated.connect(self._on_mode_pick)
+            row.addWidget(QtWidgets.QLabel("Mode"))
+            row.addWidget(self.cmb_mode)
+
+            self.freq_dial = FrequencyDial()
+            self.freq_dial.tuned.connect(self._on_dial_tuned)
+            row.addWidget(self.freq_dial)
+
+            sep = QtWidgets.QFrame()
+            sep.setFrameShape(_qt_frameshape("VLine"))
+            sep.setStyleSheet("color:#ccc;")
+            row.addWidget(sep)
 
         self.cb_auto = QtWidgets.QCheckBox("Auto-scale")
         self.cb_auto.setChecked(True)
@@ -652,7 +874,7 @@ class Panadapter(QtWidgets.QMainWindow):
         self.cmb_fft = QtWidgets.QComboBox()
         for n in (512, 1024, 2048, 4096, 8192):
             self.cmb_fft.addItem(str(n), n)
-        self.cmb_fft.setCurrentText("2048")
+        self.cmb_fft.setCurrentText("4096")
         self.cmb_fft.currentIndexChanged.connect(self._on_fft)
         row.addWidget(self.cmb_fft)
 
@@ -688,6 +910,306 @@ class Panadapter(QtWidgets.QMainWindow):
 
         row.addStretch(1)
         return row
+
+    # -- radio DSP controls (second toolbar row) -----------------------------
+    def _build_dsp_controls(self):
+        """A second toolbar row for RX DSP / front-end controls: AGC, manual
+        gain, RIT, noise reduction, noise blanker, notch, audio-peak filter,
+        squelch, and preamp. Each mirrors the live control-API `status`, so a
+        change made in the shell (or another client) moves the widget here, and
+        moving it here commands the radio. (Backend: control_api status now
+        reports these fields; see _sync_dsp_controls.)"""
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(6)
+        # guard flag: True while we're pushing polled state INTO a widget, so the
+        # widget's change signal doesn't bounce back as a command (feedback loop).
+        self._dsp_syncing = False
+        self._dsp_labels = {}          # key -> value QLabel
+
+        # AGC mode dropdown
+        row.addWidget(QtWidgets.QLabel("AGC"))
+        self.cmb_agc = QtWidgets.QComboBox()
+        self.cmb_agc.addItems(["auto", "on", "off"])
+        self.cmb_agc.setToolTip("AGC mode (auto/on/off). Manual gain sets a "
+                                "fixed gain, which shows here as 'off'.")
+        self.cmb_agc.activated.connect(self._on_agc_pick)
+        row.addWidget(self.cmb_agc)
+
+        # manual audio gain (implies AGC off). Log-ish range 100..50000.
+        self._add_dsp_slider(row, "Gain", "gain", lo=100, hi=50000, step=100,
+                             tip="Fixed audio gain (turns AGC off)")
+        # RIT ±2 kHz
+        self._add_dsp_slider(row, "RIT", "rit", lo=-2000, hi=2000, step=10,
+                             suffix=" Hz", tip="Receiver incremental tuning")
+        # noise reduction / blanker / audio peak filter / squelch: 0..1
+        for label, key, tip in (
+                ("NR", "nr", "Noise reduction (0 = off)"),
+                ("NB", "nb", "Noise blanker (0 = off)"),
+                ("APF", "apf", "Audio peak filter (0 = off)"),
+                ("SQL", "squelch", "Squelch level (0 = open)")):
+            self._add_dsp_slider(row, label, key, lo=0, hi=100, step=1,
+                                 scale=0.01, tip=tip)
+        # notch: 0..5000 Hz (0 = off)
+        self._add_dsp_slider(row, "Notch", "notch", lo=0, hi=5000, step=10,
+                             suffix=" Hz", tip="Notch filter frequency (0 = off)")
+
+        # bandwidth presets (mode-aware: CW 200/400/600, SSB 2.4/2.7/3.0k) +
+        # a Custom button that prompts for an exact width in Hz. Buttons are
+        # rebuilt on mode change (_rebuild_bw_presets) and highlight-track the
+        # live width (_highlight_bw_preset).
+        row.addWidget(QtWidgets.QLabel("BW"))
+        self._bw_layout = QtWidgets.QHBoxLayout()
+        self._bw_layout.setSpacing(2)
+        self._bw_buttons = []
+        self._bw_mode = None
+        row.addLayout(self._bw_layout)
+        self.btn_bw_custom = QtWidgets.QPushButton("Custom")
+        self.btn_bw_custom.setFixedWidth(56)
+        self.btn_bw_custom.setToolTip("Set an exact filter bandwidth in Hz")
+        self.btn_bw_custom.clicked.connect(self._on_bw_custom)
+        row.addWidget(self.btn_bw_custom)
+        self._rebuild_bw_presets("USB")
+
+        sep2 = QtWidgets.QFrame()
+        sep2.setFrameShape(_qt_frameshape("VLine"))
+        sep2.setStyleSheet("color:#ccc;")
+        row.addWidget(sep2)
+
+        # preamp / attenuator dropdown
+        row.addWidget(QtWidgets.QLabel("Preamp"))
+        self.cmb_preamp = QtWidgets.QComboBox()
+        for lbl in ("-20", "-10", "0", "+10"):
+            self.cmb_preamp.addItem(lbl)
+        self.cmb_preamp.setToolTip("RX preamp / attenuator (dB)")
+        self.cmb_preamp.activated.connect(self._on_preamp_pick)
+        row.addWidget(self.cmb_preamp)
+
+        row.addStretch(1)
+        return row
+
+    def _add_dsp_slider(self, row, label, key, *, lo, hi, step=1, scale=1.0,
+                        suffix="", tip=""):
+        """Add a labeled horizontal slider that commands the control API `key`.
+        Slider integers map to command values via `scale` (value = slider*scale).
+        Stashes the widget as self.sl_<key> and a value QLabel in _dsp_labels."""
+        row.addWidget(QtWidgets.QLabel(label))
+        sl = QtWidgets.QSlider(HORIZONTAL)
+        sl.setRange(int(lo), int(hi))
+        sl.setSingleStep(int(step))
+        sl.setFixedWidth(80)
+        if tip:
+            sl.setToolTip(tip)
+        sl._scale = scale
+        sl._suffix = suffix
+        sl._key = key
+        sl.valueChanged.connect(lambda v, k=key: self._on_dsp_slider(k, v))
+        setattr(self, f"sl_{key}", sl)
+        row.addWidget(sl)
+        val = QtWidgets.QLabel("—")
+        val.setStyleSheet("QLabel{color:#333;font-size:11px;}")
+        val.setFixedWidth(46)
+        self._dsp_labels[key] = val
+        row.addWidget(val)
+
+    def _fmt_dsp_value(self, sl, value):
+        v = value * sl._scale
+        if sl._scale < 1.0:
+            return f"{v:.2f}{sl._suffix}"
+        return f"{int(round(v))}{sl._suffix}"
+
+    def _on_dsp_slider(self, key, value):
+        sl = getattr(self, f"sl_{key}")
+        self._dsp_labels[key].setText(self._fmt_dsp_value(sl, value))
+        if self._dsp_syncing:
+            return                        # programmatic update — don't command
+        cmdval = value * sl._scale
+        arg = f"{cmdval:.3f}" if sl._scale < 1.0 else f"{int(round(cmdval))}"
+        reply = self.ctrl.send_command(f"{key} {arg}")
+        if not (reply and reply.startswith("OK")):
+            self.cursor_lbl.setText(f"{key} failed: {reply or 'no reply'}")
+
+    def _on_agc_pick(self, _idx):
+        mode = self.cmb_agc.currentText()
+        reply = self.ctrl.send_command(f"agc {mode}")
+        if not (reply and reply.startswith("OK")):
+            self.cursor_lbl.setText(f"agc failed: {reply or 'no reply'}")
+
+    def _on_preamp_pick(self, _idx):
+        state = self.cmb_preamp.currentText()
+        reply = self.ctrl.send_command(f"preamp {state}")
+        if not (reply and reply.startswith("OK")):
+            self.cursor_lbl.setText(f"preamp failed: {reply or 'no reply'}")
+
+    def _sync_dsp_controls(self, st):
+        """Mirror the polled `status` DSP fields into the second-row widgets
+        WITHOUT emitting commands. Skips a widget whose dropdown is open or whose
+        slider the user is dragging, so we don't fight active edits."""
+        self._dsp_syncing = True
+        try:
+            # AGC dropdown: 'auto'/'on'/'off'; a 'fixed:...' mode reads as 'off'.
+            agc = st.get("agc")
+            if agc is not None and not self.cmb_agc.view().isVisible():
+                shown = "off" if str(agc).startswith("fixed:") else str(agc)
+                if shown in ("auto", "on", "off") and self.cmb_agc.currentText() != shown:
+                    self.cmb_agc.setCurrentText(shown)
+            # sliders
+            for key in ("gain", "rit", "nr", "nb", "apf", "squelch", "notch"):
+                sl = getattr(self, f"sl_{key}", None)
+                if sl is None or sl.isSliderDown():
+                    continue
+                raw = st.get(key)
+                if raw is None or raw in ("None", ""):
+                    continue
+                try:
+                    want = int(round(float(raw) / sl._scale))
+                except ValueError:
+                    continue
+                want = max(sl.minimum(), min(sl.maximum(), want))
+                if sl.value() != want:
+                    sl.setValue(want)
+                else:
+                    # value unchanged but label may be "—" on first sync
+                    self._dsp_labels[key].setText(self._fmt_dsp_value(sl, want))
+            # preamp dropdown
+            pa = st.get("preamp")
+            if (pa is not None and pa not in ("None", "")
+                    and not self.cmb_preamp.view().isVisible()):
+                if self.cmb_preamp.findText(str(pa)) >= 0 \
+                        and self.cmb_preamp.currentText() != str(pa):
+                    self.cmb_preamp.setCurrentText(str(pa))
+        finally:
+            self._dsp_syncing = False
+
+    # -- filter passband overlay --------------------------------------------
+    def _update_filter_overlay(self, st):
+        """Position the filter region + dial line from the polled status. The
+        region is drawn in ABSOLUTE Hz (dial+offset); status carries RF offsets
+        (filter_lo/filter_hi). Also refreshes the preset-button highlight."""
+        # dial line at the exact tuned frequency
+        if self.center_hz:
+            self.dial_line.setPos(self.center_hz)
+            self.dial_line_wf.setPos(self.center_hz)
+        lo = st.get("filter_lo")
+        hi = st.get("filter_hi")
+        if lo is None or hi is None or lo in ("None", "") or hi in ("None", ""):
+            # control API is up but not reporting the passband — the radio
+            # process is almost certainly running OLDER code (restart solsdr to
+            # pick up the filter_lo/filter_hi status fields). Note it once.
+            if not getattr(self, "_warned_no_filter", False):
+                self._warned_no_filter = True
+                self.cursor_lbl.setText(
+                    "filter overlay: radio isn't reporting filter_lo/hi — "
+                    "restart solsdr to enable the passband display")
+            return
+        self._warned_no_filter = False
+        try:
+            lo = float(lo); hi = float(hi)
+        except ValueError:
+            return
+        self._filter_lo_hz, self._filter_hi_hz = lo, hi
+        abs_lo = self.center_hz + lo
+        abs_hi = self.center_hz + hi
+        # push into both regions without triggering the drag-finished handler
+        self._filter_syncing = True
+        try:
+            self.filter_region.setRegion((abs_lo, abs_hi))
+            self.filter_region_wf.setRegion((abs_lo, abs_hi))
+            if not self.filter_region.isVisible():
+                self.filter_region.setVisible(True)
+                self.filter_region_wf.setVisible(True)
+        finally:
+            self._filter_syncing = False
+        if hasattr(self, "_bw_buttons"):
+            self._highlight_bw_preset(hi - lo)
+
+    def _on_filter_drag(self):
+        """User dragged a filter-region edge on the spectrum. Convert the
+        absolute-Hz edges back to RF offsets from the dial and command the
+        radio. Ignored while we're programmatically syncing the region."""
+        if self._filter_syncing or not self.can_control:
+            return
+        a, b = self.filter_region.getRegion()
+        lo = int(round(a - self.center_hz))
+        hi = int(round(b - self.center_hz))
+        if hi < lo:
+            lo, hi = hi, lo
+        reply = self.ctrl.send_command(f"filter {lo} {hi}")
+        if reply and reply.startswith("OK"):
+            self._filter_lo_hz, self._filter_hi_hz = lo, hi
+            self.filter_region_wf.setRegion((self.center_hz + lo,
+                                             self.center_hz + hi))
+            self.cursor_lbl.setText(f"filter -> {lo}..{hi} Hz")
+        else:
+            self.cursor_lbl.setText(f"filter failed: {reply or 'no reply'}")
+
+    # -- bandwidth presets ---------------------------------------------------
+    def _apply_bandwidth(self, width_hz):
+        """Set the passband to `width_hz` wide, preserving the current mode's
+        placement (USB above the dial, LSB below, CW centered on 0). Commands
+        the radio via the control API."""
+        if not self.can_control:
+            return
+        mode = self.cmb_mode.currentText() if self.cmb_mode else "USB"
+        w = float(width_hz)
+        if mode == "LSB":
+            lo, hi = -(300.0 + w), -300.0     # keep the 300 Hz inner edge
+        elif mode in ("CW", "CWU", "CWL"):
+            lo, hi = -w / 2.0, w / 2.0
+        elif mode in ("AM", "FM"):
+            lo, hi = -w / 2.0, w / 2.0
+        else:                                  # USB and anything else
+            lo, hi = 300.0, 300.0 + w
+        lo, hi = int(round(lo)), int(round(hi))
+        reply = self.ctrl.send_command(f"filter {lo} {hi}")
+        if reply and reply.startswith("OK"):
+            self.cursor_lbl.setText(f"BW {int(w)} Hz -> filter {lo}..{hi}")
+        else:
+            self.cursor_lbl.setText(f"BW set failed: {reply or 'no reply'}")
+
+    def _bw_presets_for_mode(self, mode):
+        """(label, width_hz) presets appropriate to a mode."""
+        if mode in ("CW", "CWU", "CWL"):
+            return [("200", 200), ("400", 400), ("600", 600)]
+        # SSB / AM / FM voice-ish
+        return [("2.4k", 2400), ("2.7k", 2700), ("3.0k", 3000)]
+
+    def _rebuild_bw_presets(self, mode):
+        """Rebuild the preset buttons for the current mode (CW vs SSB widths)."""
+        if not hasattr(self, "_bw_layout"):
+            return
+        # clear existing preset buttons
+        for b in getattr(self, "_bw_buttons", []):
+            self._bw_layout.removeWidget(b)
+            b.deleteLater()
+        self._bw_buttons = []
+        for label, width in self._bw_presets_for_mode(mode):
+            btn = QtWidgets.QPushButton(label)
+            btn.setFixedWidth(42)
+            btn.setCheckable(True)
+            btn.setToolTip(f"Set filter bandwidth to {label} "
+                           f"({width} Hz)")
+            btn.clicked.connect(lambda _=False, w=width: self._apply_bandwidth(w))
+            btn._bw_width = width
+            self._bw_layout.addWidget(btn)
+            self._bw_buttons.append(btn)
+        self._bw_mode = mode
+
+    def _on_bw_custom(self):
+        """Prompt for an exact filter bandwidth (Hz) and apply it."""
+        cur = 0
+        if self._filter_lo_hz is not None and self._filter_hi_hz is not None:
+            cur = int(round(self._filter_hi_hz - self._filter_lo_hz))
+        w, ok = QtWidgets.QInputDialog.getInt(
+            self, "Custom bandwidth", "Filter bandwidth (Hz):",
+            value=max(cur, 100), min=50, max=20000, step=50)
+        if ok:
+            self._apply_bandwidth(w)
+
+    def _highlight_bw_preset(self, width_hz):
+        """Check the preset button matching the current width (within 1 Hz),
+        uncheck the rest. The custom drag/shell width just leaves none checked."""
+        for b in getattr(self, "_bw_buttons", []):
+            b.setChecked(abs(b._bw_width - width_hz) < 1.0)
 
     # -- control callbacks ---------------------------------------------------
     def _on_auto(self, v):
@@ -764,6 +1286,94 @@ class Panadapter(QtWidgets.QMainWindow):
         mp = vb.mapSceneToView(pos)
         self._set_cursor(mp.x(), mp.y())
 
+    def _on_click(self, ev):
+        """Click-to-tune: map the click x-position to a frequency and command
+        the radio there via the control API. Left-click only; ignores clicks
+        outside the plot. Needs the control API (--control-api on the radio)."""
+        try:
+            from pyqtgraph.Qt import QtCore
+            if ev.button() != QtCore.Qt.MouseButton.LeftButton:
+                return
+        except Exception:
+            pass
+        pos = ev.scenePos()
+        if self.p_spec.sceneBoundingRect().contains(pos):
+            freq = self.p_spec.vb.mapSceneToView(pos).x()
+        elif self.p_wf.sceneBoundingRect().contains(pos):
+            freq = self.p_wf.vb.mapSceneToView(pos).x()
+        else:
+            return
+        self._tune_to(freq, label="click")
+
+    # -- radio control widgets ----------------------------------------------
+    def _tune_to(self, freq_hz, label=None):
+        """Command the radio to freq_hz via the control API and re-center the
+        display. Shared by click-to-tune and the frequency dial."""
+        freq_hz = int(round(freq_hz))
+        if not self.can_control:
+            self.cursor_lbl.setText("tuning needs the control API "
+                                    "(start solsdr with the control API on)")
+            return False
+        reply = self.ctrl.send_command(f"freq {freq_hz}")
+        if reply and reply.startswith("OK"):
+            self.center_hz = float(freq_hz)     # re-center immediately
+            self._zoom_center_hz = None
+            if self.freq_dial is not None:
+                self.freq_dial.set_hz(freq_hz)
+            self.cursor_lbl.setText(
+                f"{label or 'tuned'} -> {freq_hz/1e6:.5f} MHz")
+            return True
+        self.cursor_lbl.setText(f"tune failed: {reply or 'no reply'}")
+        return False
+
+    def _on_dial_tuned(self, freq_hz):
+        """Frequency dial digit clicked / zeroized."""
+        self._tune_to(freq_hz, label="dial")
+
+    def _on_mode_pick(self, _idx):
+        """Mode dropdown changed by the operator."""
+        mode = self.cmb_mode.currentText()
+        reply = self.ctrl.send_command(f"mode {mode}")
+        if reply and reply.startswith("OK"):
+            self.cursor_lbl.setText(f"mode -> {mode}")
+        else:
+            self.cursor_lbl.setText(f"mode set failed: {reply or 'no reply'}")
+
+    def _sync_controls(self):
+        """Mirror the live polled radio state into the control widgets WITHOUT
+        firing their change signals — so external changes (shell, other clients)
+        are reflected here. Skips a widget while the user is actively editing it
+        (dropdown popup open) to avoid yanking it out from under them."""
+        # dial-frequency line tracks the tuned center even without control (it's
+        # informational, not interactive).
+        if hasattr(self, "dial_line") and self.center_hz:
+            self.dial_line.setPos(self.center_hz)
+            self.dial_line_wf.setPos(self.center_hz)
+        if not self.can_control:
+            return
+        st = self.ctrl.state()
+        # frequency dial follows center_hz (already updated from status)
+        if self.freq_dial is not None and self.center_hz:
+            self.freq_dial.set_hz(self.center_hz)
+        # mode dropdown follows status; setCurrentText doesn't emit activated()
+        # (that's user-only), so this won't loop back into a command.
+        m = st.get("mode")
+        if (self.cmb_mode is not None and m and m in CONTROL_MODES
+                and not self.cmb_mode.view().isVisible()
+                and self.cmb_mode.currentText() != m):
+            self.cmb_mode.setCurrentText(m)
+        # second-row DSP controls (present only when built)
+        if hasattr(self, "cmb_agc"):
+            self._sync_dsp_controls(st)
+        # filter passband overlay + dial line + preset highlight
+        if hasattr(self, "filter_region"):
+            self._update_filter_overlay(st)
+        # rebuild BW presets if the mode changed (CW widths vs SSB widths)
+        m = st.get("mode")
+        if (hasattr(self, "_bw_layout") and m
+                and m != getattr(self, "_bw_mode", None)):
+            self._rebuild_bw_presets(m)
+
     def _set_cursor(self, freq_hz, level):
         self.vline.setPos(freq_hz)
         self.vline_wf.setPos(freq_hz)
@@ -790,12 +1400,23 @@ class Panadapter(QtWidgets.QMainWindow):
             self.rate = self.iq.rate or self.rate
 
         self._update_info()
+        self._sync_controls()
 
         if self.freeze:
             return
         iq = self.iq.latest(self.proc.n)
         if iq is None:
             return
+
+        # Sideband orientation: the SunSDR2's RX IQ comes off the wire with the
+        # spectrum mirrored relative to true RF (a USB signal, physically ABOVE
+        # the dial, lands at NEGATIVE baseband). Conjugating before the FFT flips
+        # it so positive offset = above the dial = right on screen, matching the
+        # dial/filter overlay and rig convention. Display-only — the demod's own
+        # decode path is unaffected. (self.spectrum_invert lets a differently-
+        # wired setup turn it off.)
+        if self.spectrum_invert:
+            iq = np.conj(iq)
 
         spec_db, peak_db = self.proc.process(iq, kill_dc=self.kill_dc)
         disp = spec_db + self.ref_offset
@@ -952,7 +1573,8 @@ class Panadapter(QtWidgets.QMainWindow):
 
 def main():
     p = argparse.ArgumentParser(
-        description="solsdr panadapter — live spectrum + waterfall (display only)")
+        description="solsdr panadapter + control panel — live spectrum, "
+                    "waterfall, click-to-tune, mode & frequency control")
     p.add_argument("--host", default="127.0.0.1",
                    help="solsdr host (default 127.0.0.1)")
     p.add_argument("--port", type=int, default=5555,
@@ -961,8 +1583,8 @@ def main():
                    help="control API port for live radio state (default 5556)")
     p.add_argument("--no-control", action="store_true",
                    help="don't poll the control API (spectrum/waterfall only)")
-    p.add_argument("--fft", type=int, default=2048,
-                   help="initial FFT size (default 2048)")
+    p.add_argument("--fft", type=int, default=4096,
+                   help="initial FFT size (default 4096)")
     p.add_argument("--ref-offset", type=float, default=0.0,
                    help="dB added to the dBFS scale to read approximate dBm "
                         "(calibrate for your setup; default 0 => axis is dBFS)")
@@ -1002,6 +1624,10 @@ def main():
     if ctrl:
         ctrl.start()
 
+    if ctrl is None and not args.file:
+        print("no control API (--no-control): running as a display only — "
+              "tuning and the mode/frequency controls are disabled.",
+              file=sys.stderr)
     app = QtWidgets.QApplication(sys.argv)
     win = Panadapter(iq, ctrl, fft_size=args.fft, ref_offset=args.ref_offset,
                      wf_history=args.history, rescale_interval=args.rescale,

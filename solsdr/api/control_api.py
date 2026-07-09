@@ -14,9 +14,22 @@ Protocol (case-insensitive commands, one per line):
     rit <hz>             -> OK rit=<hz>   (0 = off)
     squelch|sql <0-1>    -> OK squelch=<lvl>
     agc <auto|on|off|fixed:GAIN> -> OK agc=<mode>
+    filter <lo> <hi>     -> OK filter_lo=<hz> filter_hi=<hz>
+                            (passband as RF offsets from the dial: USB +, LSB −,
+                             CW around 0. e.g. USB `filter 300 2700`)
+    gain <value>         -> OK gain=<value>   (fixed audio gain; implies AGC off)
     nr <0-1>             -> OK nr=<lvl>
+    nb <0-1>             -> OK nb=<lvl>
+    notch <hz>           -> OK notch=<hz>   (0 = off)
+    apf <0-1>            -> OK apf=<lvl>   (audio peak filter; 0 = off)
     smeter               -> OK smeter=<dBFS>
-    status               -> OK freq=<hz> mode=<m> ptt=<on|off> power=<w> streaming=<0|1> smeter=<dBFS>
+    status               -> OK freq=.. mode=.. ptt=.. power=.. streaming=.. smeter=..
+                              agc=.. gain=.. rit=.. nr=.. nb=.. notch=.. apf=..
+                              squelch=.. preamp=..
+                            (DSP/front-end fields are present only when the
+                             backing control object exposes them, so a status
+                             reader can MIRROR the live radio state — changes
+                             made via the shell or another client show up here.)
     ping                 -> OK pong
     quit                 -> OK bye  (closes connection)
 
@@ -119,6 +132,35 @@ class ControlAPIServer:
         """
         return self._handle_line(line)
 
+    # Attributes appended to `status` when the backing control object exposes
+    # them. `fmt` renders the value; a field is skipped if the attr is missing
+    # or None, so status stays clean on a partial/mock backend.
+    _DSP_STATUS = [
+        ('agc', lambda v: str(v)),
+        ('gain', lambda v: f'{float(v):g}'),
+        ('rit', lambda v: f'{float(v):g}'),
+        ('filter_lo', lambda v: f'{float(v):g}'),
+        ('filter_hi', lambda v: f'{float(v):g}'),
+        ('nr', lambda v: f'{float(v):g}'),
+        ('nb', lambda v: f'{float(v):g}'),
+        ('notch', lambda v: f'{float(v):g}'),
+        ('apf', lambda v: f'{float(v):g}'),
+        ('squelch', lambda v: f'{float(v):g}'),
+        ('preamp', lambda v: str(v)),
+    ]
+
+    def _dsp_status_fields(self):
+        out = []
+        for name, fmt in self._DSP_STATUS:
+            val = getattr(self.radio, name, None)
+            if val is None:
+                continue
+            try:
+                out.append(f'{name}={fmt(val)}')
+            except (ValueError, TypeError):
+                continue
+        return (' ' + ' '.join(out)) if out else ''
+
     def _handle_line(self, line):
         if not line:
             return 'ERR empty'
@@ -206,11 +248,46 @@ class ControlAPIServer:
                     return 'ERR unsupported agc'
                 self.radio.set_agc(args[0])
                 return f'OK agc={args[0]}'
+            if cmd == 'filter':
+                if len(args) < 2:
+                    return 'ERR filter requires <lo_hz> <hi_hz> (RF offsets)'
+                if not hasattr(self.radio, 'set_filter'):
+                    return 'ERR unsupported filter'
+                lo, hi = float(args[0]), float(args[1])
+                ok = self.radio.set_filter(lo, hi)
+                if ok is False:
+                    return 'ERR filter set failed'
+                return f'OK filter_lo={lo:g} filter_hi={hi:g}'
+            if cmd == 'gain' or cmd == 'vol':
+                if not args:
+                    return 'ERR gain requires <value>'
+                if not hasattr(self.radio, 'set_gain'):
+                    return 'ERR unsupported gain'
+                g = float(args[0])
+                self.radio.set_gain(g)
+                return f'OK gain={g:g}'
             if cmd == 'nr':
                 if not args or not hasattr(self.radio, 'set_nr'):
                     return 'ERR nr requires <0-1>' if not args else 'ERR unsupported nr'
                 self.radio.set_nr(float(args[0]))
                 return f'OK nr={float(args[0]):g}'
+            if cmd == 'nb':
+                if not args or not hasattr(self.radio, 'set_nb'):
+                    return 'ERR nb requires <0-1>' if not args else 'ERR unsupported nb'
+                self.radio.set_nb(float(args[0]))
+                return f'OK nb={float(args[0]):g}'
+            if cmd == 'notch':
+                if not args or not hasattr(self.radio, 'set_notch'):
+                    return ('ERR notch requires <hz> (0=off)' if not args
+                            else 'ERR unsupported notch')
+                hz = float(args[0])
+                self.radio.set_notch(hz)
+                return f'OK notch={hz:g}'
+            if cmd == 'apf':
+                if not args or not hasattr(self.radio, 'set_apf'):
+                    return 'ERR apf requires <0-1>' if not args else 'ERR unsupported apf'
+                self.radio.set_apf(float(args[0]))
+                return f'OK apf={float(args[0]):g}'
             if cmd == 'smeter':
                 # Real RX signal level in dBFS. (Note: cannot be pushed over
                 # CAT — the dummy rigctld backend rejects L STRENGTH — so it's
@@ -233,9 +310,14 @@ class ControlAPIServer:
                 live_m = getattr(self.radio, 'current_mode', None)
                 freq = live_f if live_f else s["freq"]
                 mode = live_m if live_m else s["mode"]
+                # RX DSP / front-end state, so a client can MIRROR (not just
+                # set) the radio. Each field is emitted only if the backing
+                # control object exposes it (mock radio doesn't), keeping the
+                # API decoupled from any concrete implementation.
+                extra = self._dsp_status_fields()
                 return (f'OK freq={freq} mode={mode} '
                         f'ptt={"on" if s["ptt"] else "off"} '
-                        f'power={s["power"]} streaming={streaming}{sm_str}')
+                        f'power={s["power"]} streaming={streaming}{sm_str}{extra}')
             return f'ERR unknown command: {cmd}'
         except ValueError as e:
             return f'ERR bad argument: {e}'

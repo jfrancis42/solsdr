@@ -81,6 +81,14 @@ class Demodulator:
         self.cw_pitch = float(cw_pitch)
         self.cw_bandwidth = float(cw_bandwidth)
 
+        # Filter passband as RF OFFSETS from the dial frequency, in Hz (the rig
+        # convention): USB is positive (a signal above the dial), LSB negative,
+        # CW centered on 0 (you tune ON the signal). This pair is the single
+        # source of truth for the passband — the audio-domain filter, the
+        # control-API `filter` command, and the panadapter's on-screen highlight
+        # all derive from it. Seeded to the mode's default.
+        self.filter_lo, self.filter_hi = self._default_passband(self.mode)
+
         # SSB voice passband; CW uses a narrow filter around the CW pitch.
         self._design_filters()
 
@@ -107,30 +115,89 @@ class Demodulator:
         # S-meter state (smoothed)
         self.smeter_dbfs = -120.0
 
+    def _default_passband(self, mode):
+        """Default filter passband as (lo, hi) RF offsets from the dial, in Hz,
+        for a mode. USB above the dial (+), LSB below (−), CW centered on 0
+        (width = cw_bandwidth), AM/FM symmetric about the dial."""
+        m = mode.upper()
+        if m == 'USB':
+            return (300.0, 2700.0)
+        if m == 'LSB':
+            return (-2700.0, -300.0)
+        if m in ('CW', 'CWU', 'CWL'):
+            half = max(25.0, self.cw_bandwidth / 2)
+            return (-half, half)
+        if m == 'AM':
+            return (-5000.0, 5000.0)
+        if m == 'FM':
+            return (-6000.0, 6000.0)
+        return (300.0, 2700.0)
+
+    def _audio_band(self):
+        """Map the RF-offset passband (filter_lo, filter_hi) to the AUDIO-domain
+        band [a_lo, a_hi] the post-demod bandpass runs at, accounting for how
+        each mode moves RF offset -> audio frequency:
+          USB: audio = offset            LSB: audio = -offset
+          CWU: audio = offset + pitch     CWL: audio = pitch - offset
+        Returns a positive-going (a_lo < a_hi) pair."""
+        lo, hi = self.filter_lo, self.filter_hi
+        m = self.mode
+        if m == 'USB':
+            a = (lo, hi)
+        elif m == 'LSB':
+            a = (-hi, -lo)
+        elif m in ('CW', 'CWU'):
+            a = (self.cw_pitch + lo, self.cw_pitch + hi)
+        elif m == 'CWL':
+            a = (self.cw_pitch - hi, self.cw_pitch - lo)
+        else:                             # AM/FM: |offset| about the dial
+            a = (0.0, max(abs(lo), abs(hi)))
+        return (min(a), max(a))
+
     def _design_filters(self):
         nyq = self.wire_rate / 2
         # SSB / CW audio-band filters expressed at the wire rate.
         def bp(lo, hi):
             lo = max(lo, 1.0)
             hi = min(hi, nyq * 0.98)
+            if hi <= lo:
+                hi = lo + 1.0
             return signal.butter(6, [lo, hi], btype='band',
                                  fs=self.wire_rate, output='sos')
-        self._ssb = bp(300, 2700)        # standard SSB voice passband
-        # CW: narrow bandpass centered on the beat-note pitch, width = cw_bandwidth
-        half = max(25.0, self.cw_bandwidth / 2)
-        self._cw = bp(self.cw_pitch - half, self.cw_pitch + half)
-        self._am = signal.butter(6, 5000, btype='low',
+        # The SSB and CW post-demod bandpasses are both derived from the current
+        # RF-offset passband (see _audio_band); which of the two `process()` uses
+        # depends on the mode, but they share the same passband source of truth.
+        a_lo, a_hi = self._audio_band()
+        self._ssb = bp(a_lo, a_hi)
+        self._cw = bp(a_lo, a_hi)
+        # AM detector lowpass tracks the passband's outer edge.
+        am_hi = min(max(abs(self.filter_lo), abs(self.filter_hi)), nyq * 0.98)
+        self._am = signal.butter(6, max(am_hi, 500.0), btype='low',
                                  fs=self.wire_rate, output='sos')
         self._zi_ssb = signal.sosfilt_zi(self._ssb)
         self._zi_cw = signal.sosfilt_zi(self._cw)
         self._zi_am = signal.sosfilt_zi(self._am)
 
+    def set_filter(self, lo_hz, hi_hz):
+        """Set the filter passband as RF offsets from the dial (Hz) and rebuild.
+        lo < hi is enforced. Sign convention: USB +, LSB −, CW around 0."""
+        lo, hi = float(lo_hz), float(hi_hz)
+        if hi < lo:
+            lo, hi = hi, lo
+        self.filter_lo, self.filter_hi = lo, hi
+        self._design_filters()
+
     def set_cw(self, pitch=None, bandwidth=None):
-        """Adjust CW pitch and/or filter bandwidth (Hz) and rebuild the filter."""
+        """Adjust CW pitch and/or filter bandwidth (Hz) and rebuild the filter.
+        In a CW mode, changing the bandwidth re-centers the passband on 0 at the
+        new width (keeping the tune-on-signal convention)."""
         if pitch is not None:
             self.cw_pitch = float(pitch)
         if bandwidth is not None:
             self.cw_bandwidth = float(bandwidth)
+            if self.mode in ('CW', 'CWU', 'CWL'):
+                half = max(25.0, self.cw_bandwidth / 2)
+                self.filter_lo, self.filter_hi = -half, half
         self._design_filters()
 
     def set_agc(self, mode):
@@ -140,6 +207,10 @@ class Demodulator:
 
     def set_mode(self, mode: str):
         self.mode = mode.upper()
+        # Reset the passband to the new mode's default and rebuild the audio
+        # filter (a USB passband makes no sense in CW, and vice-versa).
+        self.filter_lo, self.filter_hi = self._default_passband(self.mode)
+        self._design_filters()
 
     def _update_smeter(self, iq):
         p = np.mean(np.abs(iq) ** 2)
