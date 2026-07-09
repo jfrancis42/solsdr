@@ -17,6 +17,7 @@ Protocol (case-insensitive commands, one per line):
     filter <lo> <hi>     -> OK filter_lo=<hz> filter_hi=<hz>
                             (passband as RF offsets from the dial: USB +, LSB −,
                              CW around 0. e.g. USB `filter 300 2700`)
+    sharpness <s>        -> OK sharpness=<s>   (SSB skirt: soft|normal|sharp)
     gain <value>         -> OK gain=<value>   (fixed audio gain; implies AGC off)
     nr <0-1>             -> OK nr=<lvl>
     nb <0-1>             -> OK nb=<lvl>
@@ -141,6 +142,7 @@ class ControlAPIServer:
         ('rit', lambda v: f'{float(v):g}'),
         ('filter_lo', lambda v: f'{float(v):g}'),
         ('filter_hi', lambda v: f'{float(v):g}'),
+        ('sharpness', lambda v: str(v)),
         ('nr', lambda v: f'{float(v):g}'),
         ('nb', lambda v: f'{float(v):g}'),
         ('notch', lambda v: f'{float(v):g}'),
@@ -258,6 +260,15 @@ class ControlAPIServer:
                 if ok is False:
                     return 'ERR filter set failed'
                 return f'OK filter_lo={lo:g} filter_hi={hi:g}'
+            if cmd == 'sharpness' or cmd == 'skirt':
+                if not args:
+                    return 'ERR sharpness requires <soft|normal|sharp>'
+                if not hasattr(self.radio, 'set_sharpness'):
+                    return 'ERR unsupported sharpness'
+                ok = self.radio.set_sharpness(args[0].lower())
+                if ok is False:
+                    return 'ERR bad sharpness (soft|normal|sharp)'
+                return f'OK sharpness={args[0].lower()}'
             if cmd == 'gain' or cmd == 'vol':
                 if not args:
                     return 'ERR gain requires <value>'

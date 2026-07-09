@@ -55,8 +55,24 @@ class _StreamResampler:
 
 
 class Demodulator:
+    # SSB filter sharpness profiles (FIR, applied to the translated-to-DC
+    # complex signal). Each is (stopband_atten_dB, transition_hz). FIR is used
+    # rather than high-order IIR because it's unconditionally stable and exact
+    # across block boundaries; sharper = more taps = more latency + CPU. Numbers
+    # measured on real captured IQ (attenuation just outside the passband edge):
+    #   soft   ~= old 6-pole Butterworth feel (gentle, ~3 ms)
+    #   normal : ~62 dB 300 Hz outside the edge, ~6 ms  (default; like a real rig)
+    #   sharp  : near-brick-wall, ~13 ms, ~2x CPU (crowded bands)
+    SHARPNESS_PROFILES = {
+        'soft':   (35.0, 600.0),
+        'normal': (60.0, 300.0),
+        'sharp':  (90.0, 150.0),
+    }
+    DEFAULT_SHARPNESS = 'normal'
+
     def __init__(self, wire_rate=39062.5, audio_rate=48000, mode='USB',
-                 agc='auto', cw_pitch=600.0, cw_bandwidth=250.0):
+                 agc='auto', cw_pitch=600.0, cw_bandwidth=250.0,
+                 filter_sharpness='normal'):
         """
         agc: 'auto'  -> AGC on for voice modes (USB/LSB/AM/FM), off for CW/data
              'on'    -> always AGC
@@ -80,6 +96,9 @@ class Demodulator:
         self.agc_mode = agc
         self.cw_pitch = float(cw_pitch)
         self.cw_bandwidth = float(cw_bandwidth)
+        self.filter_sharpness = (filter_sharpness
+                                 if filter_sharpness in self.SHARPNESS_PROFILES
+                                 else self.DEFAULT_SHARPNESS)
 
         # Filter passband as RF OFFSETS from the dial frequency, in Hz (the rig
         # convention): USB is positive (a signal above the dial), LSB negative,
@@ -174,12 +193,25 @@ class Demodulator:
         # sideband (the image) is rejected. Taking iq.real directly does NOT do
         # this: real-part folds -f onto +f, so a station below the dial aliases
         # onto one above it (the double-sideband bug). Verified on real captured
-        # IQ: 48 dB image rejection, wanted side preserved, block-exact.
+        # IQ: image rejected, wanted side preserved, block-exact.
+        #
+        # The low-pass is a KAISER FIR (not a Butterworth SOS): a 6-pole
+        # Butterworth rolls off too gently — a signal only 300 Hz outside the
+        # passband edge was just ~12 dB down and clearly audible. The FIR gives a
+        # much steeper, defined skirt (see SHARPNESS_PROFILES) and is
+        # unconditionally stable + exact across blocks (high-order elliptic IIR
+        # would ring). Sharpness (atten, transition width) selects taps.
         self._ssb_center = 0.5 * (self.filter_lo + self.filter_hi)   # Hz offset
         self._ssb_half = max(50.0, 0.5 * abs(self.filter_hi - self.filter_lo))
-        ssb_cut = min(self._ssb_half, nyq * 0.98)
-        self._ssb = signal.butter(6, ssb_cut, btype='low',
-                                  fs=self.wire_rate, output='sos')
+        atten, trans = self.SHARPNESS_PROFILES.get(
+            self.filter_sharpness, self.SHARPNESS_PROFILES[self.DEFAULT_SHARPNESS])
+        # place the -6 dB cutoff half a transition above the half-bandwidth so
+        # the passband edge sits at ~0 dB (flat across the highlight).
+        cutoff = min(self._ssb_half + trans / 2.0, nyq * 0.98)
+        ntaps, beta = signal.kaiserord(atten, trans / nyq)
+        ntaps = max(31, ntaps | 1)             # odd (Type-I linear phase)
+        self._ssb_taps = signal.firwin(ntaps, cutoff, window=('kaiser', beta),
+                                       fs=self.wire_rate).astype(np.float64)
         # CW post-demod bandpass (BFO already shifts the note to cw_pitch).
         a_lo, a_hi = self._audio_band()
         self._cw = bp(a_lo, a_hi)
@@ -187,8 +219,9 @@ class Demodulator:
         am_hi = min(max(abs(self.filter_lo), abs(self.filter_hi)), nyq * 0.98)
         self._am = signal.butter(6, max(am_hi, 500.0), btype='low',
                                  fs=self.wire_rate, output='sos')
-        # complex low-pass carries COMPLEX filter state (I and Q independently).
-        self._zi_ssb = signal.sosfilt_zi(self._ssb).astype(np.complex128)
+        # FIR complex low-pass carries COMPLEX filter state (I and Q separately).
+        self._zi_ssb = (signal.lfilter_zi(self._ssb_taps, 1.0)
+                        .astype(np.complex128))
         self._zi_cw = signal.sosfilt_zi(self._cw)
         self._zi_am = signal.sosfilt_zi(self._am)
         # SSB translate-mixer phase (carried across blocks; set in __init__ but
@@ -204,6 +237,17 @@ class Demodulator:
             lo, hi = hi, lo
         self.filter_lo, self.filter_hi = lo, hi
         self._design_filters()
+
+    def set_sharpness(self, sharpness):
+        """Set the SSB filter skirt sharpness ('soft'/'normal'/'sharp') and
+        rebuild. Sharper = steeper rolloff outside the passband, at the cost of
+        more latency + CPU. Unknown values are ignored (keeps current)."""
+        s = str(sharpness).lower()
+        if s not in self.SHARPNESS_PROFILES:
+            return False
+        self.filter_sharpness = s
+        self._design_filters()
+        return True
 
     def set_cw(self, pitch=None, bandwidth=None):
         """Adjust CW pitch and/or filter bandwidth (Hz) and rebuild the filter.
@@ -302,7 +346,8 @@ class Demodulator:
             ph = self._ssb_phase + dphi * np.arange(n)
             self._ssb_phase = float((self._ssb_phase + dphi * n) % (2 * np.pi))
             base = np.conj(iq.astype(np.complex128)) * np.exp(-1j * ph)
-            base, self._zi_ssb = signal.sosfilt(self._ssb, base, zi=self._zi_ssb)
+            base, self._zi_ssb = signal.lfilter(self._ssb_taps, 1.0, base,
+                                                zi=self._zi_ssb)
             audio = (base * np.exp(1j * ph)).real
         elif m in ('CW', 'CWU', 'CWL'):
             # Digital BFO: the CW signal sits at the tuned frequency (near DC in

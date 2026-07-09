@@ -80,13 +80,15 @@ def test_demod_adjustable_passband():
     from solsdr.dsp.demod import Demodulator
     WR = 39062.5
 
-    def usb_tone_level(dem, offset_hz):
-        # a complex tone at +offset_hz baseband = a USB signal `offset` above dial
-        n = 16384
+    def usb_tone_level(dem, rf_offset_hz):
+        # A USB signal at RF offset `rf_offset_hz` above the dial. The SunSDR2
+        # wire IQ is sideband-mirrored and the demod conjugates, so a real +offset
+        # signal arrives at NEGATIVE baseband: inject exp(-j2*pi*offset*t). Longer
+        # block so the sharp FIR fully warms up before measuring.
+        n = 60000
         t = np.arange(n) / WR
-        iq = np.exp(2j * np.pi * offset_hz * t).astype(np.complex64)
-        # prime filter state, then measure steady-state output power
-        dem.process(iq[:n // 2])
+        iq = np.exp(-2j * np.pi * rf_offset_hz * t).astype(np.complex64)
+        dem.process(iq[:n // 2])                 # prime filter state
         out = dem.process(iq[n // 2:])
         return float(np.sqrt(np.mean(out ** 2)) + 1e-12)
 
@@ -95,10 +97,8 @@ def test_demod_adjustable_passband():
     assert Demodulator(mode='LSB').filter_hi == -300
 
     # a 2000 Hz USB tone passes the default 300..2700 band but is rejected by a
-    # narrow 300..1000 band. Compare with AGC off so the AGC can't re-normalize
-    # the rejected tone back up.
-    # unity gain (fixed:1) so the fixed_gain*clip doesn't saturate both to 0.98
-    # and mask the filtering.
+    # narrow 300..1000 band. Unity gain (fixed:1) so the fixed_gain*clip doesn't
+    # saturate both to 0.98 and mask the filtering.
     wide = usb_tone_level(Demodulator(mode='USB', agc='fixed:1'), 2000.0)
     d = Demodulator(mode='USB', agc='fixed:1'); d.set_filter(300, 1000)
     narrow = usb_tone_level(d, 2000.0)
@@ -151,6 +151,42 @@ def test_ssb_image_rejection():
           f'opposite sidebands)')
 
 
+def test_ssb_filter_sharpness():
+    """Selectable SSB skirt sharpness: sharper profiles must attenuate a signal
+    just OUTSIDE the passband edge more, and pass the in-band signal equally.
+    Guards the 'gentle filter leaks adjacent signals' bug."""
+    from solsdr.dsp.demod import Demodulator
+    WR = 39062.5
+
+    def resp(sharp, rf_offset):
+        d = Demodulator(mode='USB', agc='fixed:1', filter_sharpness=sharp)
+        n = 60000
+        t = np.arange(n) / WR
+        iq = np.exp(-2j * np.pi * rf_offset * t).astype(np.complex64)
+        d.process(iq[:n // 2]); out = d.process(iq[n // 2:])
+        return float(np.sqrt(np.mean(out ** 2)) + 1e-15)
+
+    # in-band (1500 Hz, inside 300..2700) passes at ~full level for all profiles
+    inband = {s: resp(s, 1500) for s in ('soft', 'normal', 'sharp')}
+    assert min(inband.values()) > 0.5 * max(inband.values()), inband
+
+    # 300 Hz outside the edge (+3000): sharper -> more attenuation
+    a_soft = resp('soft', 3000)
+    a_norm = resp('normal', 3000)
+    a_sharp = resp('sharp', 3000)
+    assert a_norm < a_soft, f'normal not sharper than soft ({a_norm} vs {a_soft})'
+    assert a_sharp < a_norm, f'sharp not sharper than normal ({a_sharp} vs {a_norm})'
+    # normal must actually reject the adjacent signal well (>40 dB down)
+    rej = 20 * np.log10(resp('normal', 1500) / a_norm)
+    assert rej > 40, f'normal only {rej:.0f} dB down 300 Hz outside edge'
+
+    # runtime switch works
+    d = Demodulator(mode='USB')
+    assert d.set_sharpness('sharp') and d.filter_sharpness == 'sharp'
+    assert not d.set_sharpness('bogus') and d.filter_sharpness == 'sharp'
+    print(f'PASS SSB filter sharpness (normal {rej:.0f} dB down at edge+300)')
+
+
 if __name__ == '__main__':
     test_notch_cuts_interferer()
     test_apf_narrows()
@@ -160,4 +196,5 @@ if __name__ == '__main__':
     test_chain_all_off_is_passthrough()
     test_demod_adjustable_passband()
     test_ssb_image_rejection()
+    test_ssb_filter_sharpness()
     print('\nFILTER TESTS PASSED')
