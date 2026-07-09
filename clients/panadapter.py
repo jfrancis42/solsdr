@@ -136,6 +136,11 @@ class TenthsAxisItem(pg.AxisItem):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self._minor_spacing = None
+        # Longer physical tick stubs below the axis (default -5) so both major and
+        # minor marks are easy to see; per-level BRIGHTNESS is boosted in
+        # generateDrawSpecs (pyqtgraph otherwise dims minor ticks to ~half alpha,
+        # making them nearly invisible over the FFT trace).
+        self.setStyle(tickLength=-12)
 
     def tickValues(self, minVal, maxVal, size):
         base = super().tickValues(minVal, maxVal, size)
@@ -161,6 +166,37 @@ class TenthsAxisItem(pg.AxisItem):
                 and abs(spacing - self._minor_spacing) < self._minor_spacing * 1e-6):
             return ['' for _ in values]
         return super().tickStrings(values, scale, spacing)
+
+    def generateDrawSpecs(self, p):
+        """Brighten the tick/grid pens so the minor (tenths) marks read clearly.
+
+        pyqtgraph dims deeper tick levels: with the grid on, minor grid lines get
+        roughly half the alpha of the major ones and nearly vanish under the FFT
+        trace. Each tickSpec is (pen, p1, p2). We DON'T change geometry (lengths
+        are the grid-line heights — flattening them would erase the grid);
+        instead we raise each pen's alpha to a clear floor and keep major lines
+        brightest. Longest lines = major (labeled), shorter = minor."""
+        specs = super().generateDrawSpecs(p)
+        if specs is None:
+            return specs
+        axisSpec, tickSpecs, textSpecs = specs
+        if not tickSpecs:
+            return specs
+        # pyqtgraph tags the level by pen ALPHA: major grid lines get a higher
+        # alpha than minor ones (measured ~63 vs ~18 at our grid setting). Key off
+        # that to boost each to a clearly visible floor while keeping major >
+        # minor so the tenths read as subticks, not equals.
+        alphas = [pen.color().alpha() for pen, _, _ in tickSpecs]
+        amax = max(alphas) if alphas else 0
+        new = []
+        for (pen, p1, p2), a in zip(tickSpecs, alphas):
+            pen = QtGui.QPen(pen)
+            col = QtGui.QColor(pen.color())
+            is_major = amax > 0 and a >= 0.5 * amax
+            col.setAlpha(210 if is_major else 120)   # was ~63 / ~18
+            pen.setColor(col)
+            new.append((pen, p1, p2))
+        return (axisSpec, new, textSpecs)
 
 
 def _qt_frameshape(member):
