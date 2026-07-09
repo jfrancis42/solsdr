@@ -6,7 +6,8 @@ without speaking the raw SunSDR UDP protocol. One socket, newline-delimited
 commands, human-readable replies.
 
 Protocol (case-insensitive commands, one per line):
-    freq <hz>            -> OK freq=<hz>
+    freq <hz>            -> OK freq=<hz>   (absolute; or +<hz>/-<hz> to step
+                            relative to the current freq, e.g. `freq +1000`)
     mode <USB|LSB|AM|FM|CW> -> OK mode=<mode>
     ptt <on|off|0|1>     -> OK ptt=<on|off>
     power <watts>        -> OK power=<watts>
@@ -177,9 +178,16 @@ class ControlAPIServer:
             if cmd == 'freq':
                 if not args:
                     return 'ERR freq requires <hz>'
-                hz = int(args[0])
                 if not hasattr(self.radio, 'set_frequency'):
                     return 'ERR unsupported freq'
+                tok = args[0]
+                if tok[0] in '+-':
+                    # relative step in Hz from the current tuned freq
+                    cur = getattr(self.radio, 'current_freq', None) or \
+                        self.state.get('freq') or 0
+                    hz = int(cur) + int(tok)
+                else:
+                    hz = int(tok)
                 ok = self.radio.set_frequency(hz)
                 if ok is False:
                     return 'ERR freq set failed'

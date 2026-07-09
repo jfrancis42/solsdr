@@ -358,6 +358,7 @@ dummy load, and obeys the amp-limit / calibration interlocks.
 
   TUNING / MODE
     <kHz>              tune to frequency in kHz            (e.g. 7074)
+    +<Hz> / -<Hz>      step current freq by Hz  (e.g. +1000 up 1 kHz, -500 down)
     m <mode>           mode: USB LSB AM FM CW CWU CWL
     cw on|off          live Morse (CW) decode (RX)
     cw pitch <Hz>      CW RX beat-note pitch (e.g. cw pitch 700)
@@ -878,6 +879,18 @@ def interactive_loop(rx):
             rx.filters.apf.set(level=float(line[4:])); print(f'  APF={line[4:].strip()}')
         elif line.startswith('sql '):
             rx.filters.squelch.level = float(line[4:]); print(f'  squelch={rx.filters.squelch.level}')
+        elif line and line[0] in '+-' and line[1:2].strip():
+            # relative frequency step in Hz: "+1000" = up 1 kHz, "-500" = down
+            # 500 Hz, from the current center. (Bare numbers below are absolute
+            # kHz.)
+            try:
+                delta_hz = float(line)
+            except ValueError:
+                print(f'  ? unknown command: {line!r} — type "help"'); continue
+            cur_hz = (rx.rx2_hz if target_rx == 1 else rx.freq_hz) or 0
+            new_khz = (cur_hz + delta_hz) / 1000.0
+            rx.tune(new_khz, rx=target_rx)
+            print(f'  RX{target_rx + 1} tuned {delta_hz:+g} Hz -> {new_khz:g} kHz')
         else:
             try:
                 khz = float(line)
