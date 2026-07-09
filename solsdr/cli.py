@@ -67,6 +67,9 @@ class _RadioControlAdapter:
     def set_filter(self, lo_hz, hi_hz):
         self._rx.channels[0].demod.set_filter(lo_hz, hi_hz); return True
 
+    def set_sharpness(self, s):
+        return self._rx.channels[0].demod.set_sharpness(s)
+
     def set_gain(self, gain):
         # Fixed audio gain = AGC off at a manual gain (matches the shell's
         # `gain`/`vol`). Stored in the demod as the agc mode 'fixed:<g>'.
@@ -113,6 +116,10 @@ class _RadioControlAdapter:
     @property
     def filter_hi(self):
         return self._rx.channels[0].demod.filter_hi
+
+    @property
+    def sharpness(self):
+        return self._rx.channels[0].demod.filter_sharpness
 
     @property
     def nr(self):
@@ -391,6 +398,9 @@ dummy load, and obeys the amp-limit / calibration interlocks.
     filter <lo> <hi>   passband edges as RF offsets from the dial (Hz):
                        USB +, LSB -, CW around 0. e.g. USB "filter 300 2700",
                        LSB "filter -2700 -300", CW "filter -250 250"
+    sharpness <s>      SSB filter skirt: soft | normal | sharp (default normal).
+                       sharper = steeper rolloff outside the passband, more
+                       latency/CPU. (no arg shows current)
     nr <0-1>           noise reduction        nb <0-1>   noise blanker
     notch <Hz|0>       manual notch (0=off)   apf <0-1>  audio peak filter (CW)
     sql <0-1>          squelch threshold
@@ -582,6 +592,7 @@ def _live_params(rx):
         'agc': ch.demod.agc_mode,
         'filter_lo': ch.demod.filter_lo,
         'filter_hi': ch.demod.filter_hi,
+        'sharpness': ch.demod.filter_sharpness,
         'rit_hz': getattr(ch.demod, 'rit_hz', 0.0),
         'nr': ch.filters.nr.level,
         'nb': ch.filters.nb.level,
@@ -611,6 +622,8 @@ def _read_config(rx):
             rx.tune(float(c['freq_khz'])); applied.append(f"freq={c['freq_khz']}")
         if 'mode' in c:
             rx.set_mode(str(c['mode'])); applied.append(f"mode={c['mode']}")
+        if 'sharpness' in c:
+            rx.channels[0].demod.set_sharpness(str(c['sharpness']))
         # filter AFTER mode (set_mode resets the passband to the mode default)
         if 'filter_lo' in c and 'filter_hi' in c:
             rx.channels[0].demod.set_filter(float(c['filter_lo']),
@@ -685,12 +698,15 @@ _TOP_COMMANDS = [
     'tx', 'tune', 'read-config', 'write-config',
     'm', 'cw', 'ref', 'lpf', 'lna', 'mic', 'preamp', 'rit',
     'agc', 'gain', 'vol', 'nr', 'nb', 'notch', 'apf', 'sql', 'filter',
+    'sharpness', 'skirt',
 ]
 _SUB_COMPLETIONS = {
     'tx':     ['power', 'maxpower', 'mode', 'micgain', 'wpm', 'cwtone',
                'sidetone', 'prefix'],
     'm':      ['USB', 'LSB', 'AM', 'FM', 'CW', 'CWU', 'CWL'],
     'agc':    ['auto', 'on', 'off', 'fixed:'],
+    'sharpness': ['soft', 'normal', 'sharp'],
+    'skirt':     ['soft', 'normal', 'sharp'],
     'ref':    ['ext', 'int'],
     'lpf':    ['on', 'off'],
     'lna':    ['on', 'off'],
@@ -832,6 +848,21 @@ def interactive_loop(rx):
                           f'{d.filter_lo:g}..{d.filter_hi:g} Hz')
                 except ValueError as e:
                     print(f'  {e}')
+        elif line.startswith('sharpness') or line.startswith('skirt'):
+            d = rx.channels[target_rx].demod
+            parts = line.split()
+            profiles = ', '.join(sorted(d.SHARPNESS_PROFILES))
+            if len(parts) < 2:
+                print(f'  RX{target_rx + 1} filter sharpness = '
+                      f'{d.filter_sharpness}  (choices: {profiles})')
+            elif d.set_sharpness(parts[1]):
+                atten, trans = d.SHARPNESS_PROFILES[d.filter_sharpness]
+                print(f'  RX{target_rx + 1} filter sharpness -> '
+                      f'{d.filter_sharpness} ({len(d._ssb_taps)} taps, '
+                      f'~{len(d._ssb_taps)/2/d.wire_rate*1000:.0f} ms, '
+                      f'{atten:.0f} dB stop)')
+            else:
+                print(f'  unknown sharpness {parts[1]!r} (choices: {profiles})')
         elif line.startswith('gain ') or line.startswith('vol '):
             g = float(line.split(None, 1)[1])
             # audio output level = fixed (linear) gain; implies AGC off
