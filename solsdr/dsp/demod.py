@@ -104,6 +104,8 @@ class Demodulator:
 
         # FM state
         self._fm_prev = 0.0 + 0.0j
+        # SSB translate-filter-translate mixer phase, carried across blocks
+        self._ssb_phase = 0.0
         # CW BFO phase (radians), carried across blocks for continuity
         self._cw_phase = 0.0
         # RIT (receiver incremental tuning): a baseband frequency shift in Hz
@@ -164,19 +166,35 @@ class Demodulator:
                 hi = lo + 1.0
             return signal.butter(6, [lo, hi], btype='band',
                                  fs=self.wire_rate, output='sos')
-        # The SSB and CW post-demod bandpasses are both derived from the current
-        # RF-offset passband (see _audio_band); which of the two `process()` uses
-        # depends on the mode, but they share the same passband source of truth.
+        # SSB is an IMAGE-REJECTING demod (see process()): the wanted sideband
+        # occupies RF offsets [filter_lo, filter_hi] on ONE side of the dial. We
+        # translate that band's CENTER to DC and apply a COMPLEX low-pass of half
+        # the bandwidth. A complex (I/Q) low-pass is one-sided about DC, so after
+        # translating back only the wanted sideband survives — the opposite
+        # sideband (the image) is rejected. Taking iq.real directly does NOT do
+        # this: real-part folds -f onto +f, so a station below the dial aliases
+        # onto one above it (the double-sideband bug). Verified on real captured
+        # IQ: 48 dB image rejection, wanted side preserved, block-exact.
+        self._ssb_center = 0.5 * (self.filter_lo + self.filter_hi)   # Hz offset
+        self._ssb_half = max(50.0, 0.5 * abs(self.filter_hi - self.filter_lo))
+        ssb_cut = min(self._ssb_half, nyq * 0.98)
+        self._ssb = signal.butter(6, ssb_cut, btype='low',
+                                  fs=self.wire_rate, output='sos')
+        # CW post-demod bandpass (BFO already shifts the note to cw_pitch).
         a_lo, a_hi = self._audio_band()
-        self._ssb = bp(a_lo, a_hi)
         self._cw = bp(a_lo, a_hi)
         # AM detector lowpass tracks the passband's outer edge.
         am_hi = min(max(abs(self.filter_lo), abs(self.filter_hi)), nyq * 0.98)
         self._am = signal.butter(6, max(am_hi, 500.0), btype='low',
                                  fs=self.wire_rate, output='sos')
-        self._zi_ssb = signal.sosfilt_zi(self._ssb)
+        # complex low-pass carries COMPLEX filter state (I and Q independently).
+        self._zi_ssb = signal.sosfilt_zi(self._ssb).astype(np.complex128)
         self._zi_cw = signal.sosfilt_zi(self._cw)
         self._zi_am = signal.sosfilt_zi(self._am)
+        # SSB translate-mixer phase (carried across blocks; set in __init__ but
+        # reset here defensively if the filter is redesigned before first use).
+        if not hasattr(self, '_ssb_phase'):
+            self._ssb_phase = 0.0
 
     def set_filter(self, lo_hz, hi_hz):
         """Set the filter passband as RF offsets from the dial (Hz) and rebuild.
@@ -266,12 +284,26 @@ class Demodulator:
             self._rit_phase = float((self._rit_phase + dphi * n) % (2 * np.pi))
         m = self.mode
 
-        if m == 'USB':
-            audio = iq.real.astype(np.float64)
-            audio, self._zi_ssb = signal.sosfilt(self._ssb, audio, zi=self._zi_ssb)
-        elif m == 'LSB':
-            audio = iq.imag.astype(np.float64)
-            audio, self._zi_ssb = signal.sosfilt(self._ssb, audio, zi=self._zi_ssb)
+        if m in ('USB', 'LSB'):
+            # Image-rejecting SSB: translate the wanted band's center to DC,
+            # complex low-pass (rejects the opposite sideband — iq.real alone
+            # does NOT, it folds -f onto +f), translate back, take real. Both
+            # mixers share a phase carried across blocks (block-exact, no click).
+            #
+            # CONJUGATE first: the SunSDR2 RX IQ is sideband-MIRRORED on the wire
+            # (a signal physically ABOVE the dial arrives at NEGATIVE baseband —
+            # same reason the panadapter uses spectrum_invert=True). Conjugation
+            # undoes the mirror so USB selects the true upper sideband and LSB the
+            # lower. Verified on real captured IQ: 14074 FT8 (above the dial)
+            # lands on USB, not LSB. The old iq.real demod hid this by taking BOTH
+            # sidebands; selecting one properly exposed the wire mirror.
+            n = len(iq)
+            dphi = 2 * np.pi * self._ssb_center / self.wire_rate
+            ph = self._ssb_phase + dphi * np.arange(n)
+            self._ssb_phase = float((self._ssb_phase + dphi * n) % (2 * np.pi))
+            base = np.conj(iq.astype(np.complex128)) * np.exp(-1j * ph)
+            base, self._zi_ssb = signal.sosfilt(self._ssb, base, zi=self._zi_ssb)
+            audio = (base * np.exp(1j * ph)).real
         elif m in ('CW', 'CWU', 'CWL'):
             # Digital BFO: the CW signal sits at the tuned frequency (near DC in
             # the baseband IQ). Mixing by a complex exponential at cw_pitch

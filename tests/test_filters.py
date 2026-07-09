@@ -110,6 +110,47 @@ def test_demod_adjustable_passband():
     print('PASS demod adjustable passband (narrowing rejects out-of-band tone)')
 
 
+def test_ssb_image_rejection():
+    """USB/LSB must reject the OPPOSITE sideband (single-sideband, not double).
+
+    This guards the double-sideband bug: taking iq.real folds -f onto +f, so a
+    station on one side of the dial aliased onto the other. The fixed demod
+    selects ONE sideband and rejects the image.
+
+    Sign note: the SunSDR2 RX IQ is sideband-MIRRORED on the wire, so the demod
+    conjugates. Net effect in these synthetic tests (tone at exp(+j2*pi*f*t)):
+    USB selects NEGATIVE baseband, LSB selects POSITIVE. What matters for this
+    test is that each mode passes ONE side and rejects the other by >30 dB.
+
+    Measured at UNITY gain (fixed:1) — the default fixed_gain (3000x) clips both
+    to full scale and would mask the rejection (this exact measurement trap hid
+    the bug during dev)."""
+    from solsdr.dsp.demod import Demodulator
+    WR = 39062.5
+
+    def level(offset_hz, mode='USB'):
+        d = Demodulator(mode=mode, agc='fixed:1')
+        n = 60000
+        t = np.arange(n) / WR
+        iq = (0.01 * np.exp(2j * np.pi * offset_hz * t)).astype(np.complex64)
+        d.process(iq[:n // 2])                 # prime filter/mixer state
+        out = d.process(iq[n // 2:])
+        return float(np.sqrt(np.mean(out ** 2)) + 1e-15)
+
+    # USB passes one baseband sign and rejects the other; LSB is the mirror.
+    # (After the wire-mirror conjugation, USB=negative baseband, LSB=positive.)
+    usb_pass, usb_img = level(-1500, 'USB'), level(1500, 'USB')
+    lsb_pass, lsb_img = level(1500, 'LSB'), level(-1500, 'LSB')
+    urej = 20 * np.log10(usb_pass / usb_img)
+    lrej = 20 * np.log10(lsb_pass / lsb_img)
+    assert urej > 30, f'USB image rejection only {urej:.1f} dB (want >30)'
+    assert lrej > 30, f'LSB image rejection only {lrej:.1f} dB (want >30)'
+    # USB and LSB must pick OPPOSITE sides (not the same one)
+    assert (usb_pass > usb_img) and (lsb_pass > lsb_img)
+    print(f'PASS SSB image rejection (USB {urej:.0f} dB, LSB {lrej:.0f} dB, '
+          f'opposite sidebands)')
+
+
 if __name__ == '__main__':
     test_notch_cuts_interferer()
     test_apf_narrows()
@@ -118,4 +159,5 @@ if __name__ == '__main__':
     test_iq_channel_filter_runs_stateful()
     test_chain_all_off_is_passthrough()
     test_demod_adjustable_passband()
+    test_ssb_image_rejection()
     print('\nFILTER TESTS PASSED')
