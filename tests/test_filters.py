@@ -73,6 +73,43 @@ def test_chain_all_off_is_passthrough():
     print('PASS filter chain is transparent when all stages off')
 
 
+def test_demod_adjustable_passband():
+    """The demod filter passband is RF offsets from the dial. Narrowing it
+    should attenuate a tone that was inside the wide band, and set_mode resets
+    the passband to the mode default."""
+    from solsdr.dsp.demod import Demodulator
+    WR = 39062.5
+
+    def usb_tone_level(dem, offset_hz):
+        # a complex tone at +offset_hz baseband = a USB signal `offset` above dial
+        n = 16384
+        t = np.arange(n) / WR
+        iq = np.exp(2j * np.pi * offset_hz * t).astype(np.complex64)
+        # prime filter state, then measure steady-state output power
+        dem.process(iq[:n // 2])
+        out = dem.process(iq[n // 2:])
+        return float(np.sqrt(np.mean(out ** 2)) + 1e-12)
+
+    # defaults per mode
+    assert Demodulator(mode='USB').filter_lo == 300
+    assert Demodulator(mode='LSB').filter_hi == -300
+
+    # a 2000 Hz USB tone passes the default 300..2700 band but is rejected by a
+    # narrow 300..1000 band. Compare with AGC off so the AGC can't re-normalize
+    # the rejected tone back up.
+    # unity gain (fixed:1) so the fixed_gain*clip doesn't saturate both to 0.98
+    # and mask the filtering.
+    wide = usb_tone_level(Demodulator(mode='USB', agc='fixed:1'), 2000.0)
+    d = Demodulator(mode='USB', agc='fixed:1'); d.set_filter(300, 1000)
+    narrow = usb_tone_level(d, 2000.0)
+    assert narrow < wide * 0.2, f'narrow band did not reject 2 kHz tone ({narrow:.4f} vs {wide:.4f})'
+
+    # set_mode resets the passband away from a custom setting
+    d.set_mode('CW')
+    assert d.filter_lo < 0 < d.filter_hi, 'CW passband should straddle 0'
+    print('PASS demod adjustable passband (narrowing rejects out-of-band tone)')
+
+
 if __name__ == '__main__':
     test_notch_cuts_interferer()
     test_apf_narrows()
@@ -80,4 +117,5 @@ if __name__ == '__main__':
     test_noise_blanker_removes_impulse()
     test_iq_channel_filter_runs_stateful()
     test_chain_all_off_is_passthrough()
+    test_demod_adjustable_passband()
     print('\nFILTER TESTS PASSED')

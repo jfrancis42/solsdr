@@ -34,6 +34,9 @@ class _RadioControlAdapter:
     expect (set_frequency/set_mode/current_freq/current_mode/streaming)."""
     def __init__(self, rx):
         self._rx = rx
+        # The radio doesn't report its preamp/att setting back, so shadow the
+        # last successfully-applied value here for status reporting.
+        self._preamp = None
 
     def set_frequency(self, hz):
         self._rx.tune(hz / 1000.0); return True
@@ -47,7 +50,10 @@ class _RadioControlAdapter:
     # RX DSP + front-end controls exposed to the network control API (act on
     # RX1's channel; the radio-level preamp affects the whole front end).
     def set_preamp(self, state):
-        return self._rx.radio.set_preamp(state)
+        ok = self._rx.radio.set_preamp(state)
+        if ok is not False:
+            self._preamp = str(state)
+        return ok
 
     def set_rit(self, hz):
         self._rx.channels[0].demod.set_rit(hz); return True
@@ -58,8 +64,79 @@ class _RadioControlAdapter:
     def set_agc(self, mode):
         self._rx.channels[0].demod.set_agc(mode); return True
 
+    def set_filter(self, lo_hz, hi_hz):
+        self._rx.channels[0].demod.set_filter(lo_hz, hi_hz); return True
+
+    def set_gain(self, gain):
+        # Fixed audio gain = AGC off at a manual gain (matches the shell's
+        # `gain`/`vol`). Stored in the demod as the agc mode 'fixed:<g>'.
+        self._rx.channels[0].demod.set_agc(f'fixed:{float(gain):g}'); return True
+
     def set_nr(self, level):
         self._rx.channels[0].filters.nr.level = float(level); return True
+
+    def set_nb(self, level):
+        self._rx.channels[0].filters.nb.level = float(level); return True
+
+    def set_notch(self, notch_hz):
+        self._rx.channels[0].filters.notch.set_notch(float(notch_hz)); return True
+
+    def set_apf(self, level):
+        self._rx.channels[0].filters.apf.set(level=float(level)); return True
+
+    # -- readable RX DSP state (so clients can MIRROR it, not just set it) --
+    @property
+    def agc(self):
+        return self._rx.channels[0].demod.agc_mode
+
+    @property
+    def gain(self):
+        # The effective fixed audio gain: the manual value if AGC is off/fixed,
+        # else the linear-mode default the demod would apply.
+        d = self._rx.channels[0].demod
+        m = str(d.agc_mode)
+        if m.startswith('fixed:'):
+            try:
+                return float(m.split(':', 1)[1])
+            except ValueError:
+                pass
+        return float(getattr(d, 'fixed_gain', 0.0))
+
+    @property
+    def rit(self):
+        return self._rx.channels[0].demod.rit_hz
+
+    @property
+    def filter_lo(self):
+        return self._rx.channels[0].demod.filter_lo
+
+    @property
+    def filter_hi(self):
+        return self._rx.channels[0].demod.filter_hi
+
+    @property
+    def nr(self):
+        return self._rx.channels[0].filters.nr.level
+
+    @property
+    def nb(self):
+        return self._rx.channels[0].filters.nb.level
+
+    @property
+    def notch(self):
+        return self._rx.channels[0].filters.notch.notch_hz
+
+    @property
+    def apf(self):
+        return self._rx.channels[0].filters.apf.level
+
+    @property
+    def squelch(self):
+        return self._rx.channels[0].filters.squelch.level
+
+    @property
+    def preamp(self):
+        return self._preamp
 
     @property
     def current_freq(self):
@@ -311,6 +388,9 @@ dummy load, and obeys the amp-limit / calibration interlocks.
     mic <src>          mic SOURCE at the radio (mic1 | mic2 | pc)
 
   DSP FILTERS
+    filter <lo> <hi>   passband edges as RF offsets from the dial (Hz):
+                       USB +, LSB -, CW around 0. e.g. USB "filter 300 2700",
+                       LSB "filter -2700 -300", CW "filter -250 250"
     nr <0-1>           noise reduction        nb <0-1>   noise blanker
     notch <Hz|0>       manual notch (0=off)   apf <0-1>  audio peak filter (CW)
     sql <0-1>          squelch threshold
@@ -320,6 +400,9 @@ dummy load, and obeys the amp-limit / calibration interlocks.
     devices            list available audio devices
     help | ?           this help
     q | quit           quit
+
+  TAB completes commands and their arguments (e.g. "tx <TAB>", "m <TAB>");
+  up/down = history, C-a/C-e/C-r = emacs line editing.
 """.rstrip())
     if dual:
         print('  RX2 active: prefix per-receiver commands with "1 "/"2 " '
@@ -497,6 +580,8 @@ def _live_params(rx):
         'freq_khz': (rx.radio.current_freq or 0) / 1000.0,
         'mode': ch.demod.mode,
         'agc': ch.demod.agc_mode,
+        'filter_lo': ch.demod.filter_lo,
+        'filter_hi': ch.demod.filter_hi,
         'rit_hz': getattr(ch.demod, 'rit_hz', 0.0),
         'nr': ch.filters.nr.level,
         'nb': ch.filters.nb.level,
@@ -526,6 +611,11 @@ def _read_config(rx):
             rx.tune(float(c['freq_khz'])); applied.append(f"freq={c['freq_khz']}")
         if 'mode' in c:
             rx.set_mode(str(c['mode'])); applied.append(f"mode={c['mode']}")
+        # filter AFTER mode (set_mode resets the passband to the mode default)
+        if 'filter_lo' in c and 'filter_hi' in c:
+            rx.channels[0].demod.set_filter(float(c['filter_lo']),
+                                            float(c['filter_hi']))
+            applied.append(f"filter={c['filter_lo']}..{c['filter_hi']}")
         if 'agc' in c:
             rx.channels[0].demod.set_agc(str(c['agc'])); applied.append(f"agc={c['agc']}")
         if 'rit_hz' in c:
@@ -582,6 +672,46 @@ def _setup_readline():
     except OSError:
         pass
     atexit.register(lambda: _save_history(readline, hist))
+    # Tab completion for commands and their sub-arguments.
+    readline.set_completer(_completer)
+    readline.set_completer_delims(' ')          # complete whole words
+    readline.parse_and_bind('tab: complete')
+
+
+# Top-level commands and, for those that take a fixed set of args, the
+# sub-tokens to complete after them.
+_TOP_COMMANDS = [
+    'help', 'quit', 'exit', 'devices', 's', 'status',
+    'tx', 'tune', 'read-config', 'write-config',
+    'm', 'cw', 'ref', 'lpf', 'lna', 'mic', 'preamp', 'rit',
+    'agc', 'gain', 'vol', 'nr', 'nb', 'notch', 'apf', 'sql', 'filter',
+]
+_SUB_COMPLETIONS = {
+    'tx':     ['power', 'maxpower', 'mode', 'micgain', 'wpm', 'cwtone',
+               'sidetone', 'prefix'],
+    'm':      ['USB', 'LSB', 'AM', 'FM', 'CW', 'CWU', 'CWL'],
+    'agc':    ['auto', 'on', 'off', 'fixed:'],
+    'ref':    ['ext', 'int'],
+    'lpf':    ['on', 'off'],
+    'lna':    ['on', 'off'],
+    'mic':    ['mic1', 'mic2', 'pc'],
+    'preamp': ['-20', '-10', '0', '+10', 'off', 'preamp'],
+    'cw':     ['on', 'off', 'pitch', 'bw'],
+}
+
+
+def _completer(text, state):
+    """readline completer: first word -> command names; after a command that
+    has a known arg set (tx/m/agc/ref/…) -> its sub-tokens."""
+    import readline
+    buf = readline.get_line_buffer()
+    words = buf[:readline.get_begidx()].split()
+    if not words:                                # completing the command itself
+        opts = [c for c in _TOP_COMMANDS if c.startswith(text)]
+    else:
+        sub = _SUB_COMPLETIONS.get(words[0].lower())
+        opts = [s for s in sub if s.startswith(text)] if sub else []
+    return opts[state] if state < len(opts) else None
 
 
 def _save_history(readline, path):
@@ -652,7 +782,6 @@ def interactive_loop(rx):
                 if br is None:
                     print('  CW send unavailable (no TX bridge)')
                 else:
-                    print(f'  ⚠️  CW TX: sending {arg!r} — antenna/dummy load!')
                     ok, msg = br.send_cw(arg)
                     print(f'  {msg}')
         elif line.startswith('ref '):
@@ -689,6 +818,20 @@ def interactive_loop(rx):
             mode = line[4:].strip().lower()
             rx.channels[target_rx].demod.set_agc(mode)
             print(f'  RX{target_rx + 1} AGC -> {mode}')
+        elif line.startswith('filter '):
+            parts = line.split()
+            if len(parts) != 3:
+                print('  usage: filter <lo_hz> <hi_hz>  (RF offsets from dial: '
+                      'USB +, LSB -, CW around 0)')
+            else:
+                try:
+                    lo, hi = float(parts[1]), float(parts[2])
+                    d = rx.channels[target_rx].demod
+                    d.set_filter(lo, hi)
+                    print(f'  RX{target_rx + 1} filter -> '
+                          f'{d.filter_lo:g}..{d.filter_hi:g} Hz')
+                except ValueError as e:
+                    print(f'  {e}')
         elif line.startswith('gain ') or line.startswith('vol '):
             g = float(line.split(None, 1)[1])
             # audio output level = fixed (linear) gain; implies AGC off

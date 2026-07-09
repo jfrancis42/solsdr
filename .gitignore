@@ -2,6 +2,9 @@
 # calibration tooling) — not part of the public release.
 keep/
 
+# Local maintainer guidance for Claude Code — kept out of the public repo.
+CLAUDE.md
+
 # Packet captures (large, machine-specific)
 *.pcap
 *.pcapng
