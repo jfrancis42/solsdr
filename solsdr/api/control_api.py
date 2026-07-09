@@ -224,7 +224,16 @@ class ControlAPIServer:
                 streaming = int(getattr(self.radio, 'streaming', 0) or 0)
                 sm = getattr(self.radio, 's_meter', None)
                 sm_str = f' smeter={float(sm):.1f}' if sm is not None else ''
-                return (f'OK freq={s["freq"]} mode={s["mode"]} '
+                # Prefer the radio's LIVE tuned freq/mode over our shadow state.
+                # The shadow only tracks changes made THROUGH this API; the radio
+                # can also be retuned via the interactive shell, a rigctld/JS8Call
+                # client, etc. Reporting radio.current_freq/current_mode keeps a
+                # panadapter or other status reader correct after any retune.
+                live_f = getattr(self.radio, 'current_freq', None)
+                live_m = getattr(self.radio, 'current_mode', None)
+                freq = live_f if live_f else s["freq"]
+                mode = live_m if live_m else s["mode"]
+                return (f'OK freq={freq} mode={mode} '
                         f'ptt={"on" if s["ptt"] else "off"} '
                         f'power={s["power"]} streaming={streaming}{sm_str}')
             return f'ERR unknown command: {cmd}'

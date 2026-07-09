@@ -3,9 +3,9 @@
 solsdr panadapter — a live spectrum + waterfall display for the SunSDR2 PRO.
 
 A standalone, visually-nice panadapter that reads solsdr's raw-IQ TCP stream
-(`solsdr_receiver.py --iq-server`, port 5555) and, optionally, its text control
-API (port 5556) for live radio state. Pure Python: PyQt5 + pyqtgraph + numpy.
-No GNU Radio, no ExpertSDR3.
+(`python3 -m solsdr`, IQ server on port 5555, on by default) and, optionally, its
+text control API (port 5556) for live radio state. Pure Python: PyQt5 +
+pyqtgraph + numpy. No GNU Radio, no ExpertSDR3.
 
 DISPLAY ONLY — this tool never tunes, keys, or changes the radio. It shows you
 what's going on. (Control may come later.)
@@ -25,6 +25,8 @@ Features
   * Info bar: tuned freq, mode, PTT, TX power setpoint, S-meter, sample rate,
     span, and resolution bandwidth.
   * Resizable window; drag the splitter to trade spectrum height for waterfall.
+  * Frequency zoom (+/- toolbar buttons or +/- keys, 0 = full span), centered on
+    the tuned frequency; spectrum and waterfall stay aligned.
   * Averaging, peak-hold, DC-spike suppression, adjustable FFT size, freeze.
   * Fast by default (thin non-antialiased trace + periodic rescale) so it hits
     30 fps+ even on a CPU-only box; --pretty for a filled antialiased trace on a
@@ -33,7 +35,7 @@ Features
 Usage
 -----
     # live: on the machine running solsdr (RX IQ is on by default) —
-    python3 solsdr_receiver.py 14074 --control-api
+    python3 -m solsdr 14074 --control-api
 
     # then, anywhere that can reach it (needs a display; ssh -X for remote):
     python3 clients/panadapter.py --host 127.0.0.1
@@ -44,8 +46,9 @@ Usage
 Options: --host, --port (IQ, 5555), --control-port (5556), --file (replay a
 wire-format capture; loops at EOF), --fft, --ref-offset (dBFS→dBm), --rescale
 (auto-scale cadence, s), --pretty (antialiased filled trace), --no-control. Run
-with --help for all. Keys: A auto-scale · R rescale now · P peak-hold · C
-colormap · space freeze · Q quit.
+with --help for all. Keys: +/- zoom (0 = full) · A auto-scale · R rescale now ·
+P peak-hold · C colormap · space freeze · Q quit. (Zoom +/- buttons are in the
+toolbar; mouse-drag/scroll on the plot also zooms/pans.)
 
 Notes
 -----
@@ -487,6 +490,11 @@ class Panadapter(QtWidgets.QMainWindow):
         # the axis-relayout repaint) when it truly changes (see _tick).
         self._applied_yrange = (None, None)
         self._applied_xrange = (None, None)
+        # frequency zoom: the +/- buttons show a fraction of the full span,
+        # centered on the tuned frequency. 1.0 = full span; smaller = zoomed in.
+        self.zoom = 1.0
+        self._zoom_min = 0.02            # ~50x max zoom-in
+        self._zoom_center_hz = None      # None => follow the tuned center
         # autoscale recomputes the Y range on this cadence (seconds), not every
         # frame — the per-frame setYRange repaint is the main CPU cost.
         self.rescale_interval = float(rescale_interval)
@@ -605,6 +613,23 @@ class Panadapter(QtWidgets.QMainWindow):
         self.btn_rescale.clicked.connect(self.rescale_now)
         row.addWidget(self.btn_rescale)
 
+        # frequency zoom
+        row.addWidget(QtWidgets.QLabel("Zoom"))
+        self.btn_zoom_out = QtWidgets.QPushButton("−")   # minus sign
+        self.btn_zoom_out.setToolTip("Zoom out (show more of the band)")
+        self.btn_zoom_out.setFixedWidth(30)
+        self.btn_zoom_out.clicked.connect(lambda: self.zoom_by(2.0))
+        row.addWidget(self.btn_zoom_out)
+        self.btn_zoom_in = QtWidgets.QPushButton("+")
+        self.btn_zoom_in.setToolTip("Zoom in (narrower span around the tuned freq)")
+        self.btn_zoom_in.setFixedWidth(30)
+        self.btn_zoom_in.clicked.connect(lambda: self.zoom_by(0.5))
+        row.addWidget(self.btn_zoom_in)
+        self.btn_zoom_full = QtWidgets.QPushButton("Full")
+        self.btn_zoom_full.setToolTip("Reset to the full IQ span")
+        self.btn_zoom_full.clicked.connect(self.zoom_full)
+        row.addWidget(self.btn_zoom_full)
+
         row.addWidget(QtWidgets.QLabel("Ref"))
         self.sp_ref = QtWidgets.QDoubleSpinBox()
         self.sp_ref.setRange(-200, 60)
@@ -674,6 +699,27 @@ class Panadapter(QtWidgets.QMainWindow):
     def rescale_now(self):
         """Force autoscale to recompute the range on the next frame."""
         self._last_rescale = 0.0
+
+    # -- frequency zoom ------------------------------------------------------
+    def zoom_by(self, factor):
+        """Multiply the visible frequency span by `factor` (<1 zooms in,
+        >1 zooms out), centered on the tuned frequency. Clamped to [zoom_min, 1]."""
+        self.zoom = max(self._zoom_min, min(1.0, self.zoom * factor))
+        self._apply_zoom()
+
+    def zoom_full(self):
+        """Reset to the full IQ span."""
+        self.zoom = 1.0
+        self._apply_zoom()
+
+    def _apply_zoom(self):
+        """Set the spectrum x-range to the zoomed window and mark it applied so
+        _tick doesn't fight it. Waterfall follows via the linked x-axis."""
+        half = (self.rate / 2.0) * self.zoom
+        c = self._zoom_center_hz if self._zoom_center_hz is not None else self.center_hz
+        lo, hi = c - half, c + half
+        self._applied_xrange = (lo, hi)
+        self.p_spec.setXRange(lo, hi, padding=0)
 
     def _on_ref(self, v):
         self.ref_level = v
@@ -798,9 +844,16 @@ class Panadapter(QtWidgets.QMainWindow):
                 self.p_spec.setYRange(lo, hi, padding=0)
         ymin, ymax = self._applied_yrange
 
-        if (freqs[0], freqs[-1]) != self._applied_xrange:
-            self._applied_xrange = (freqs[0], freqs[-1])
-            self.p_spec.setXRange(freqs[0], freqs[-1], padding=0)
+        # x-range respects the zoom factor (centered on the tuned freq). At
+        # zoom=1 this is the full span [freqs[0], freqs[-1]]; when zoomed we show
+        # a centered window. Only re-apply on change (keeps the perf win, and
+        # lets a retune re-center the zoomed view).
+        half = (freqs[-1] - freqs[0]) / 2.0 * self.zoom
+        c = self._zoom_center_hz if self._zoom_center_hz is not None else self.center_hz
+        want = (c - half, c + half)
+        if want != self._applied_xrange:
+            self._applied_xrange = want
+            self.p_spec.setXRange(want[0], want[1], padding=0)
 
         self._update_waterfall(disp, freqs, ymin, ymax)
 
@@ -866,7 +919,14 @@ class Panadapter(QtWidgets.QMainWindow):
     # -- keyboard shortcuts --------------------------------------------------
     def keyPressEvent(self, e):
         k = e.key()
-        if k == KEY_A:
+        txt = e.text()
+        if txt in ("+", "="):          # '=' so you needn't hold shift for '+'
+            self.zoom_by(0.5)
+        elif txt == "-":
+            self.zoom_by(2.0)
+        elif txt == "0":
+            self.zoom_full()
+        elif k == KEY_A:
             self.cb_auto.toggle()
         elif k == KEY_R:
             self.rescale_now()

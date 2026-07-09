@@ -109,9 +109,10 @@ on‑air by JS8Call through the audio bridge. See **Transmit** below.
 | Stateful DSP filters (NR / NB / notch / APF / squelch) | ✅ unit‑tested |
 | Transmit chain (SSB/AM/FM modulate, pacing, PTT/drive/PA) | ✅ on‑air verified into dummy load |
 | Per‑band TX power calibration + amp‑protection limit | ✅ calibrated on all 10 HF bands (wattmeter‑anchored); ~6 W (160 m) to ~17 W (10 m) |
+| Unified transceiver: one program, RX + in-process TX bridge, live shell control | ✅ shell keys via `tune` / `cw <text>`; `tx` sets power/mode/mic gain/wpm live |
+| CW transmit (keyboard sending, Farnsworth) | ✅ `cw <text>` from the shell; `tx wpm <char> [word]`, `tx cwtone <Hz>` |
 | Antenna port selection | ⛔ not implemented — PRO opcode not yet identified |
 | SunSDR2 DX support | ⚠️ fully coded from ArtemisSDR, **untested on hardware** (`--variant DX`) |
-| CW transmit | ⛔ not built (encoder exists) |
 
 ### Known gaps / TODO
 
@@ -132,7 +133,9 @@ on‑air by JS8Call through the audio bridge. See **Transmit** below.
   responsibly and legally.
 - **VHF** — largely untested; deliberately never keyed during TX calibration.
 - **SunSDR2 DX** — profile is coded from ArtemisSDR but unverified on hardware.
-- **CW transmit** — not built (the encoder exists).
+- **CW receive decode → shell** — the RX Morse decoder exists but decoded text
+  isn't yet surfaced in the transceiver shell (planned). CW *transmit* is done
+  (`cw <text>`).
 
 **Expected features not yet built** (a user would reasonably want these):
 
@@ -165,18 +168,22 @@ pip install .                          # from a clone; or:  pip install solsdr
 
 # Option B — run from a source checkout without installing:
 pip install -r requirements.txt        # numpy, scipy, sounddevice
+python3 -m solsdr 14074                 # run it this way from source
 ```
 
-`rigctld` (from `hamlib` / `libhamlib-utils`) is required for CAT control and
-the digital-mode bridge. For an always-on headless setup, see
+Installed, the command is **`solsdr`** (alias `solsdr-shell`); from a source
+checkout, **`python3 -m solsdr`**. `rigctld` (from `hamlib` / `libhamlib-utils`)
+and PulseAudio/PipeWire are required for the TX/digital-mode bridge (it warns and
+runs RX-only if they're absent). For an always-on headless setup, see
 [`systemd/README.md`](systemd/README.md).
 
-## Quick start — receive
+## Quick start
 
 ```bash
-# Receive 20 m FT8 with live audio; type commands at the sdr> prompt.
-solsdr 14074 --device 5                # if installed
-python3 solsdr_receiver.py 14074 --device 5   # from a source checkout
+# Tune 20 m FT8, live audio, type commands at the sdr> prompt.
+# One program = full transceiver (RX + TX bridge in-process). --no-tx for RX-only.
+solsdr 14074 --device 5                 # if installed (pip install .)
+python3 -m solsdr 14074 --device 5      # from a source checkout
 ```
 
 `--device N` selects the audio output (list with
@@ -233,28 +240,52 @@ are ignored with a warning, so a shared config can carry extra keys.
 
 ## Interactive shell — commands with examples
 
-While the receiver runs, type at the `sdr>` prompt. Bare commands act on RX1;
-prefix with `2 ` to target the second receiver (see [RX2](#second-receiver-rx2--dual-watch)).
+**`solsdr` is one program for both RX and TX.** By default it brings the
+digital‑mode/TX bridge up **in‑process** (virtual audio + a real Hamlib rigctld +
+PTT→transmit), sharing the one radio connection with the receiver. So the single
+`sdr>` shell controls the whole radio — receive, DSP, front‑end, *and* transmit
+characteristics — with TX changes applied **live** (e.g. `tx power 3` retunes the
+drive on an in‑progress over). `--no-tx` reverts to a lean RX‑only program. Type
+`help` at the prompt for the full list. Bare commands act on RX1; prefix with
+`2 ` to target the second receiver (see [RX2](#second-receiver-rx2--dual-watch)).
 
 | Command | Example | Effect |
 |---|---|---|
 | `<kHz>` | `7074` | Tune to 7074 kHz |
 | `m <mode>` | `m CW` | Set mode: USB / LSB / AM / FM / CW / CWU / CWL |
 | `cw on\|off` | `cw on` | Toggle the live Morse decoder |
+| `cw pitch\|bw <Hz>` | `cw pitch 700` | CW beat‑note pitch / filter bandwidth |
+| `agc <mode>` | `agc off` | RX audio AGC: `auto`/`on`/`off`/`fixed:<gain>` |
+| `gain <n>` / `vol <n>` | `gain 8000` | RX audio output level (fixed gain, AGC off) |
+| `tx` | `tx` | Show all TX settings (live) |
+| `tx power <W>` | `tx power 3` | TX output setpoint — **applies live while keyed** |
+| `tx maxpower <W>` | `tx maxpower 5` | Amp‑protection ceiling (safety; next over only) |
+| `tx mode <m>` | `tx mode USB` | TX modulation mode |
+| `tx micgain <x>` | `tx micgain 1.5` | TX‑audio (mic) gain — applies live |
+| `tune [s] [W]` | `tune 5 3` | ⚠️ **Key a CW tuning carrier** for `s` sec (default 3) at `W` watts (default current power). The one shell command that transmits. |
 | `s` | `s` | Print S‑meter + full status line |
 | `ref ext\|int` | `ref ext` | External 10 MHz (GPSDO) vs internal reference |
 | `lpf on\|off` | `lpf on` | HF low‑pass filter relay |
 | `lna on\|off` | `lna on` | VHF LNA |
 | `preamp <state>` | `preamp -10` | RX preamp/att: `-20` `-10` `0` `+10` dB, or `off`/`preamp` |
-| `mic <src>` | `mic pc` | Mic source: `mic1` / `mic2` / `pc` |
+| `mic <src>` | `mic pc` | Mic source at the radio: `mic1` / `mic2` / `pc` |
 | `rit <Hz>` | `rit 250` | Receiver incremental tuning (`rit 0` = off) |
 | `nr <0-1>` | `nr 0.4` | Noise reduction strength |
 | `nb <0-1>` | `nb 0.3` | Noise blanker |
 | `notch <Hz>` | `notch 800` | Manual notch (`notch 0` = off) |
 | `apf <0-1>` | `apf 0.6` | Audio peak filter (CW) |
 | `sql <0-1>` | `sql 0.2` | Squelch threshold |
-| `2 <cmd>` | `2 m CW` | Run any of the above against RX2 (e.g. `2 7074`) |
+| `devices` | `devices` | List audio devices (sounddevice + PulseAudio) |
+| `read-config` | `read-config` | Apply every setting in the config file, now |
+| `write-config` | `write-config` | Save all current live parameters to the config |
+| `2 <cmd>` | `2 m CW` | Run a per‑receiver command against RX2 (e.g. `2 7074`) |
 | `q` | `q` | Quit |
+
+TX settings are **session‑live** — they take effect immediately but aren't saved
+unless you run `write-config`. To transmit, point a digital‑mode app (JS8Call /
+WSJT‑X / fldigi) at the bridge's virtual audio + rigctld exactly as before; the
+difference is it's now the same process as the receiver, so the shell sees and
+controls the transmit state directly.
 
 ---
 
@@ -333,9 +364,11 @@ axis; frequency across the bottom (MHz) and level up the side (dBFS, or dBm via
 rate + center and follows retunes; perceptual colormaps for strong signal/noise
 contrast; live mouse crosshair readout (freq + level); an info bar with tuned
 freq, mode, PTT, TX power, S-meter, span, and RBW; a draggable splitter to trade
-spectrum vs. waterfall height; averaging, peak-hold, DC-spike hide, FFT size, and
-freeze. Keys: `A` auto-scale, `R` rescale now, `P` peak-hold, `C` cycle colormap,
-`space` freeze, `Q` quit. Run `python3 clients/panadapter.py --help` for options.
+spectrum vs. waterfall height; **frequency zoom** (`+`/`−`/`Full` toolbar buttons,
+centered on the tuned freq); averaging, peak-hold, DC-spike hide, FFT size, and
+freeze. Keys: `+`/`-` zoom (`0` = full), `A` auto-scale, `R` rescale now,
+`P` peak-hold, `C` cycle colormap, `space` freeze, `Q` quit. Run
+`python3 clients/panadapter.py --help` for options.
 
 > Performance: it's tuned to hit 30 fps+ on a **CPU-only** box. The two costs
 > that matter in software rendering are re-ranging the axis and an antialiased
@@ -444,7 +477,7 @@ The PRO's second receiver runs alongside the first with an independent frequency
 and mode — e.g. watch 20 m and 40 m at once:
 
 ```bash
-python3 solsdr_receiver.py 14074 --rx2 7074
+python3 -m solsdr 14074 --rx2 7074
 #   RX1 -> audio + IQ on :5555   |   RX2 -> IQ on :5557  (both on by default)
 #   --rx2-mode CW / --rx2-device N  set RX2's mode / audio output
 ```
@@ -516,7 +549,7 @@ finicky CAT/PTT/split capability negotiation is Hamlib's own battle‑tested cod
 not a reimplementation — the tradeoff is that **`rigctld` must be installed**
 (Debian/Ubuntu: `libhamlib-utils`; Arch: `hamlib`).
 
-Both `solsdr_receiver.py --hamlib` and `python3 -m solsdr.audio` launch the
+Both `solsdr --hamlib` and `python3 -m solsdr.audio` launch the
 rigctld for you (Hamlib dummy backend, model 1) on port 4532 and do the
 mirroring. You do not start rigctld yourself; you just point your software at it:
 
@@ -671,7 +704,7 @@ solsdr/                   the Python package
     rigctld_poller.py     launches real rigctld + mirrors freq/mode/PTT to the
                           radio — the shared CAT mechanism used by the receiver,
                           server, and audio bridge
-solsdr_receiver.py        Main receiver: live control shell + optional servers
+solsdr/cli.py             Transceiver shell: RX + in-process TX bridge + servers
 clients/                  example IQ client + GNU Radio notes
 tools/                    user utilities: FT8 self-test, IQ capture, spectrum,
                           TX power calibration (first-key, anchor, band sweep, tap)

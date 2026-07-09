@@ -5,6 +5,36 @@ is hardware-verified, the **DX** is not.
 
 ## Unreleased
 
+- **Renamed the main script** `solsdr_receiver.py` → `solsdr/cli.py` (it's a
+  transceiver now, not a receiver). Run it as **`solsdr`** (installed; alias
+  `solsdr-shell`) or **`python3 -m solsdr`** (from source). The old
+  `solsdr-receiver` console script is gone.
+- **CW keyboard sending, with Farnsworth.** `cw <text>` in the shell transmits
+  the text as Morse via the existing `CWEncoder` → an interlocked `TXSession`.
+  `tx wpm <char> [<word>]` sets element/Farnsworth spacing speed (e.g.
+  `tx wpm 25 15` = 15 wpm effective at 25 wpm element speed); `tx cwtone <Hz>`
+  sets the sidetone (default 600). `cw on|off|pitch|bw` keep their RX meanings.
+- **Unified transceiver: `solsdr` is now one program for RX and TX.** The
+  digital-mode/TX bridge (virtual audio + real rigctld + PTT→TXSession) runs
+  **in-process by default**, sharing the single `Radio` via IQ fan-out (the
+  receiver owns `start_stream` and feeds the bridge with `feed_iq`; no second
+  process, no config-relay). The interactive shell now controls TX **live**:
+    - `tx` — show all TX settings; `tx power <W>`, `tx maxpower <W>`,
+      `tx mode <m>`, `tx micgain <x>`. Power and mic gain apply to an
+      **in-progress transmission** immediately; max-power (amp-protection
+      ceiling) only takes effect on the next over and is never raised live.
+    - `tune [seconds] [watts]` — the ONE shell command that keys the radio: a
+      deliberate, time-bounded CW tuning carrier (default 3 s, current power),
+      via the interlocked TXSession (arm, amp-limit, calibration gate, dead-man);
+      refuses if a transmission is already in progress. Everything else is
+      app/CAT-driven PTT.
+    - `read-config` / `write-config` — apply the config file to the live radio,
+      or snapshot all current live parameters into it.
+    - `devices` — list audio devices (sounddevice + PulseAudio sinks).
+    - `help`/`?`, plus `agc`/`gain`/`vol` for RX audio level, and `cw pitch|bw`.
+  `--no-tx` reverts to RX-only; TX still needs PulseAudio + Hamlib rigctld (warns
+  and continues RX-only if absent). `config.py` gained `update()`/`config_path()`.
+
 - **Panadapter** (`clients/panadapter.py`): standalone live spectrum + waterfall
   display — PyQt (5/6) / PySide6 + pyqtgraph + numpy, no GNU Radio, no
   ExpertSDR3. Display-only (never tunes/keys). Shared absolute-frequency axis,
@@ -17,7 +47,9 @@ is hardware-verified, the **DX** is not.
   timer (`--rescale`, default 5 s; `R` snaps now) instead of every frame, and
   the trace is a thin non-antialiased line by default — the two big software-
   render costs. `--pretty` restores a filled antialiased trace for GPU/fast hosts.
-- **RX IQ server is now ON BY DEFAULT** in `solsdr_receiver.py` (port 5555) — the
+  Frequency **zoom** via `+`/`−`/`Full` toolbar buttons (and `+`/`-`/`0` keys),
+  centered on the tuned frequency; spectrum and waterfall stay aligned.
+- **RX IQ server is now ON BY DEFAULT** in the transceiver shell (port 5555) — the
   panadapter, GNU Radio, and recorders can attach with no flag. New
   `--no-iq-server` disables it; `--iq-server` is kept as a no-op for
   back-compatibility. The TX IQ server stays opt-in (`--iq-tx-server`) — transmit

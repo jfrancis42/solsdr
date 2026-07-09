@@ -19,9 +19,10 @@ Wants=network-online.target
 Type=simple
 User=jfrancis
 # The solsdr console entry point (installed by `pip install .`). If running from
-# a source checkout instead, use e.g.:
-#   ExecStart=/usr/bin/python3 /home/jfrancis/solsdr/solsdr_receiver.py --config /etc/solsdr/config.conf --hamlib --iq-server --seconds 0
-ExecStart=/usr/local/bin/solsdr --config /etc/solsdr/config.conf --hamlib --iq-server
+# a source checkout instead, use the module form, e.g.:
+#   ExecStart=/usr/bin/python3 -m solsdr --config /etc/solsdr/config.conf --hamlib --no-tx
+# (add --no-tx for a pure headless RX/IQ engine with no audio-bridge deps).
+ExecStart=/usr/local/bin/solsdr --config /etc/solsdr/config.conf --hamlib --no-tx
 Restart=on-failure
 RestartSec=5
 # solsdr's TX pacer wants SCHED_FIFO; grant the capability without full root.

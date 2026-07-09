@@ -50,13 +50,15 @@ def test_loud_input_no_clip():
     mod = Modulator(audio_rate=fs, wire_rate=wr, mode='USB')
     iq = mod.process(audio)
     assert np.max(np.abs(iq)) <= 0.99, 'IQ must stay in range'
-    # USB tone appears at +1000 Hz in the IQ spectrum; check for clip harmonics.
+    # A USB +1 kHz tone lands at -1000 Hz in the modulator IQ (the SunSDR2 TX
+    # path re-inverts it to +1 kHz out the antenna — see modulator.process).
+    # Check for clip harmonics around that fundamental regardless of sign.
     N = 16384
     sp = np.abs(np.fft.fftshift(np.fft.fft(iq[:N] * np.hanning(N))))
     fr = np.fft.fftshift(np.fft.fftfreq(N, 1 / wr))
-    fund = sp[(fr > 900) & (fr < 1100)].sum()
-    # harmonics of a clipped 1 kHz tone would land at 2k/3k etc.
-    harm = sp[(fr > 1500) & (fr < 6000)].sum() + 1e-9
+    fund = sp[(np.abs(fr) > 900) & (np.abs(fr) < 1100)].sum()
+    # harmonics of a clipped 1 kHz tone would land at 2k/3k etc. (either sign)
+    harm = sp[(np.abs(fr) > 1500) & (np.abs(fr) < 6000)].sum() + 1e-9
     assert fund / harm > 10, f'loud input produced clip harmonics: {fund/harm:.1f}'
     print(f'PASS loud-input leveling (IQ fundamental/harmonic {fund/harm:.0f})')
 

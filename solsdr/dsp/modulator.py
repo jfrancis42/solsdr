@@ -5,9 +5,12 @@ Inverse of dsp/demod.py. Takes real audio at audio_rate and produces complex64
 IQ at the radio wire_rate (39062.5 Hz for the PRO), ready to be packetized and
 paced to the radio.
 
-SSB is generated with a Hilbert transform (analytic signal):
-    USB:  iq = analytic(audio)              (positive-frequency only)
-    LSB:  iq = conj(analytic(audio))        (negative-frequency only)
+SSB is generated with a Hilbert transform (analytic signal). NOTE the sideband
+selection is INVERTED from the textbook baseband convention because the SunSDR2's
+TX upconverter mirrors the sideband (verified on-air 2026-07-09 against an SSA):
+    USB:  iq = conj(analytic(audio))        (so a +tone lands ABOVE the carrier)
+    LSB:  iq = analytic(audio)
+The RX path is not inverted; this flip is specific to the radio's TX mixer.
 This is the standard phasing/Weaver-equivalent method and is the exact inverse
 of the demod's "USB = real part / LSB = imag part" convention, so a
 modulate -> demodulate round-trip returns the original audio.
@@ -91,7 +94,15 @@ class Modulator:
             # Band-limit, form analytic signal, pick sideband.
             a, self._zi = signal.sosfilt(self._bpf, audio, zi=self._zi)
             analytic = signal.hilbert(a)  # complex, positive-freq content
-            iq = analytic if m == 'USB' else np.conj(analytic)
+            # NOTE: the SunSDR2's TX upconversion mirrors the sideband relative
+            # to the modulator's baseband sense (verified on-air 2026-07-09 vs.
+            # an SSA on the TX tap: a +1 kHz USB tone landed BELOW the carrier,
+            # LSB above). The RX path is NOT inverted (FT8 decodes), so this is a
+            # TX-mixer sign specific to the radio, not a math error here. So USB
+            # takes the CONJUGATE (negative-freq analytic) and LSB the plain
+            # analytic — the opposite of the textbook baseband convention — which
+            # puts a USB tone correctly ABOVE the carrier out of the antenna.
+            iq = np.conj(analytic) if m == 'USB' else analytic
         elif m == 'AM':
             # Double-sideband + carrier: (1 + m*audio) as a real envelope.
             a, self._zi = signal.sosfilt(self._bpf, audio, zi=self._zi)

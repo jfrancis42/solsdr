@@ -2,7 +2,7 @@
 """
 GNU Radio Qt waterfall + FFT viewer for the solsdr IQ stream (SunSDR2 PRO).
 
-Connects to solsdr's raw-IQ TCP server (`solsdr_receiver.py --iq-server`, or the
+Connects to solsdr's raw-IQ TCP server (`solsdr --iq-server` (or `python3 -m solsdr`), or the
 IQStreamServer on port 5555), displays a live FFT trace and a waterfall. This is
 the "is it really working?" demo: run it, see your SunSDR2 IQ in GNU Radio.
 
@@ -17,7 +17,7 @@ the complex64 samples that follow into GNU Radio via a small custom source block
 
 Usage:
     # on the machine running solsdr:
-    python3 solsdr_receiver.py 14074 --iq-server
+    python3 -m solsdr 14074 --iq-server
     # then, anywhere that can reach it (needs X/Wayland; use ssh -X for remote):
     python3 clients/gnuradio/qt_iq_waterfall.py --host 127.0.0.1 --port 5555
 
@@ -238,7 +238,7 @@ def main():
     except OSError as e:
         print(f"could not connect to solsdr IQ server at "
               f"{args.host}:{args.port}: {e}", file=sys.stderr)
-        print("start it with:  python3 solsdr_receiver.py <kHz> --iq-server",
+        print("start it with:  python3 -m solsdr <kHz> --iq-server",
               file=sys.stderr)
         sys.exit(1)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
