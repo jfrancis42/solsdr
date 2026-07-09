@@ -362,12 +362,17 @@ class JS8AudioBridge:
         Hamlib (so USB/LSB sideband and CW/AM/FM demod track the app)."""
         orig = self.radio.set_mode
 
-        def wrapped(mode):
-            ok = orig(mode)
-            try:
-                self.demod.set_mode(mode)
-            except Exception:
-                pass
+        def wrapped(mode, *args, **kwargs):
+            # Pass through all args (e.g. rx=) so the receiver's per-channel
+            # set_mode(mode, rx=N) still works with the hook installed. Only
+            # follow the bridge demod for RX1 (rx==0 / default).
+            ok = orig(mode, *args, **kwargs)
+            rx = kwargs.get('rx', args[0] if args else 0)
+            if rx == 0:
+                try:
+                    self.demod.set_mode(mode)
+                except Exception:
+                    pass
             return ok
         self.radio.set_mode = wrapped
 
