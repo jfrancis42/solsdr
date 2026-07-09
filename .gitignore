@@ -6,6 +6,15 @@ keep/
 *.pcap
 *.pcapng
 
+# Recorded IQ captures (large; GitHub rejects >100 MB and bloats clones).
+# Regenerate full-length files with tools/capture_iq_stream.py — see
+# clients/examples/README.md. Keep them locally, out of the public repo.
+# EXCEPTION: the short demo clip is committed so the panadapter has a
+# zero-setup example (see the whitelist below).
+*.iq
+*.iqz
+!clients/examples/solsdr_20m_demo30.iq
+
 # Python
 __pycache__/
 *.py[cod]

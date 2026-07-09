@@ -1,10 +1,11 @@
 # Clients
 
 The SunSDR2 SDR streams raw complex64 IQ over TCP so external tools consume it
-as network clients. Start the server side with:
+as network clients. **The RX IQ server is on by default** — just start solsdr:
 
 ```bash
-python3 solsdr_receiver.py 14074 --iq-server        # IQ on tcp :5555
+python3 solsdr_receiver.py 14074                     # IQ on tcp :5555 (default)
+python3 solsdr_receiver.py 14074 --no-iq-server      # ...or turn it off
 ```
 
 On connect the server sends one text line, then a continuous stream of
@@ -20,6 +21,24 @@ SOLSDR IQ rate=39062.5 fmt=complex64 freq=14074000\n
 ```bash
 python3 clients/iq_client.py 10.1.2.185 5555 --seconds 8
 ```
+
+## Panadapter (spectrum + waterfall)
+
+`panadapter.py` is a standalone live spectrum/waterfall display — PyQt +
+pyqtgraph + numpy, no GNU Radio. **Display only** (never tunes or keys). Reads
+the RX IQ stream and, with `--control-api` running on the radio, shows live
+freq/mode/PTT/S-meter in an info bar.
+
+```bash
+# radio host (IQ on by default; add --control-api for the info bar):
+python3 solsdr_receiver.py 14074 --control-api
+# viewer (needs a display; ssh -X for remote):
+python3 clients/panadapter.py --host 127.0.0.1
+```
+
+Auto-scale or fixed scale, absolute-frequency axis (MHz) with dBFS/dBm level
+axis, mouse crosshair readout, perceptual colormaps, averaging, peak-hold,
+adjustable FFT/window. `--help` for options; `--ref-offset <dB>` to read dBm.
 
 ## GNU Radio
 

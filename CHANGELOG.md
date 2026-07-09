@@ -3,6 +3,26 @@
 All notable changes to solsdr. This project is **alpha**; the SunSDR2 **PRO**
 is hardware-verified, the **DX** is not.
 
+## Unreleased
+
+- **Panadapter** (`clients/panadapter.py`): standalone live spectrum + waterfall
+  display — PyQt (5/6) / PySide6 + pyqtgraph + numpy, no GNU Radio, no
+  ExpertSDR3. Display-only (never tunes/keys). Shared absolute-frequency axis,
+  auto/fixed scaling, dBFS (or dBm via `--ref-offset`), mouse crosshair readout,
+  perceptual colormaps, averaging/peak-hold/DC-hide, adjustable FFT + window,
+  draggable spectrum/waterfall split, and a live info bar (freq/mode/PTT/power/
+  S-meter/span/RBW) driven off the control API. Includes a `--file` mode to
+  replay a recorded capture with no radio (loops for a hands-off demo).
+  Performance-tuned for CPU-only boxes (30 fps+): auto-scale re-ranges on a
+  timer (`--rescale`, default 5 s; `R` snaps now) instead of every frame, and
+  the trace is a thin non-antialiased line by default — the two big software-
+  render costs. `--pretty` restores a filled antialiased trace for GPU/fast hosts.
+- **RX IQ server is now ON BY DEFAULT** in `solsdr_receiver.py` (port 5555) — the
+  panadapter, GNU Radio, and recorders can attach with no flag. New
+  `--no-iq-server` disables it; `--iq-server` is kept as a no-op for
+  back-compatibility. The TX IQ server stays opt-in (`--iq-tx-server`) — transmit
+  remains a deliberate act.
+
 ## 0.2.0
 
 - **RX preamp/attenuator** control (`0x05` states `0x80`–`0x83`): `set_preamp()`,
