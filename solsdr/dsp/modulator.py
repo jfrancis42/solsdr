@@ -69,25 +69,25 @@ class Modulator:
         if len(audio) == 0:
             return np.zeros(0, dtype=np.complex64)
 
-        # Input leveling: track the running peak and scale toward full scale so
-        # BOTH loud masters (peak > 1) and quiet sources (e.g. JS8Call/WSJT-X
-        # with the audio slider well down, ~-25 dBFS) drive the modulator near
-        # unity. The actual TX power is set by the drive byte downstream, so we
-        # want a consistent, strong modulator input regardless of the app's
-        # output volume. Fast attack (instant up to a louder peak) and a
-        # moderately fast release (~0.3 s) so a quiet source levels UP within a
-        # fraction of a second rather than staying suppressed for many seconds.
-        # A noise gate avoids blowing up pure silence into full-scale hiss.
-        blk_peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
-        if blk_peak > self._in_peak:
-            self._in_peak = blk_peak           # fast attack
-        else:
-            # release: ~0.3 s time constant at 20 ms blocks -> 0.94/block
-            self._in_peak = 0.94 * self._in_peak + 0.06 * blk_peak
-        GATE = 1e-3   # below this, treat as silence — don't amplify noise
-        TARGET = 0.9  # normalize peak up/down to ~0.9 full scale
-        if self._in_peak > GATE:
-            audio = audio * (TARGET / max(self._in_peak, GATE))
+        # Input leveling (voice/data modes only). NOT for CW: there the input is
+        # an exact 0..1 keying envelope — leveling would distort the keying and
+        # the noise gate would erase the low raised-cosine ramps (key clicks /
+        # missing dits). CW passes through unscaled.
+        if self.mode not in ('CW', 'CWU', 'CWL'):
+            # track the running peak and scale toward full scale so BOTH loud
+            # masters (peak > 1) and quiet sources (e.g. JS8Call/WSJT-X with the
+            # slider well down) drive the modulator near unity. TX power is set
+            # by the drive byte downstream. Fast attack, ~0.3 s release; a noise
+            # gate avoids blowing up pure silence into full-scale hiss.
+            blk_peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+            if blk_peak > self._in_peak:
+                self._in_peak = blk_peak           # fast attack
+            else:
+                self._in_peak = 0.94 * self._in_peak + 0.06 * blk_peak
+            GATE = 1e-3
+            TARGET = 0.9
+            if self._in_peak > GATE:
+                audio = audio * (TARGET / max(self._in_peak, GATE))
 
         m = self.mode
         if m in ('USB', 'LSB'):
@@ -103,6 +103,15 @@ class Modulator:
             # analytic — the opposite of the textbook baseband convention — which
             # puts a USB tone correctly ABOVE the carrier out of the antenna.
             iq = np.conj(analytic) if m == 'USB' else analytic
+        elif m in ('CW', 'CWU', 'CWL'):
+            # CW: the input `audio` is a real 0..1 KEYING ENVELOPE (from
+            # CWEncoder.envelope), not a tone. Emit an on/off carrier at
+            # BASEBAND DC so the transmitted RF sits EXACTLY on the tuned
+            # (dial) frequency — no sidetone offset. Bypasses the SSB voice
+            # bandpass (a DC-keyed signal wouldn't survive 300-2700 Hz). The
+            # envelope's raised-cosine edges keep it click-free.
+            env = np.clip(audio.astype(np.float64), 0.0, 1.0)
+            iq = env.astype(np.complex128)      # real carrier at 0 Hz, keyed
         elif m == 'AM':
             # Double-sideband + carrier: (1 + m*audio) as a real envelope.
             a, self._zi = signal.sosfilt(self._bpf, audio, zi=self._zi)

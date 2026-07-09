@@ -289,12 +289,14 @@ dummy load, and obeys the amp-limit / calibration interlocks.
   TRANSMIT SETTINGS   (saved to config; the TX path applies them live)
     tx                 show all current TX settings
     tx power <W>       TX output setpoint in watts        (e.g. tx power 3)
-    tx maxpower <W>    amp-protection ceiling in watts (safety; None = off)
+    tx maxpower <W>    amp-protection ceiling + default TX power (default 5 W;
+                       0 = no ceiling). Also the power used when none is set.
     tx mode <mode>     TX modulation mode (USB/LSB/AM/FM)
     tx micgain <x>     mic/TX-audio gain multiplier (1.0 = unity; e.g. 1.5)
     tx wpm <c> [<w>]   CW send speed: element <c> wpm, optional Farnsworth
                        spacing <w> wpm (w<c). e.g. "tx wpm 25 15" = 15wpm@25
     tx cwtone <Hz>     CW send sidetone/pitch (default 600)
+    tx sidetone on|off local CW/tune beep on the speaker (on; or a 0-1 gain)
     tx prefix <name>   rename the virtual audio devices live -> <name>-rx.monitor
                        (fldigi/WSJT-X input) + <name>-tx (output). Drops apps
                        bound to the old names. (Set at launch with --prefix.)
@@ -355,6 +357,8 @@ def _tx_command(rx, arg):
         print(f'      -> fldigi/WSJT-X INPUT  (RX audio): {d.rx_sink_name}.monitor'
               f'  (or {d.rx_input_name})')
         print(f'      -> fldigi/WSJT-X OUTPUT (TX audio): {d.tx_sink_name}')
+        print(f'    sidetone = {"on" if br.cw_sidetone else "off"} '
+              f'(gain {br.sidetone_gain:g}; local CW/tune beep)')
         print(f'    monitor  = {br.monitor.sink or "off"}')
         return
     word = parts[0].lower()
@@ -412,9 +416,20 @@ def _tx_command(rx, arg):
                   f'apps bound to the old names will drop, repoint them.')
             ok, msg = br.set_prefix(val)
             print(f'  {msg}')
+        elif word == 'sidetone':
+            if val is None:
+                print(f'  sidetone = {"on" if br.cw_sidetone else "off"} '
+                      f'(gain {br.sidetone_gain:g})'); return
+            v = val.lower()
+            if v in ('on', 'off', '1', '0', 'true', 'false'):
+                br.cw_sidetone = v in ('on', '1', 'true')
+                print(f'  tx sidetone -> {"on" if br.cw_sidetone else "off"}')
+            else:
+                br.sidetone_gain = max(0.0, min(1.0, float(val)))
+                print(f'  tx sidetone gain -> {br.sidetone_gain:g}')
         else:
             print(f'  ? unknown tx setting {word!r}; try: '
-                  f'power maxpower mode micgain wpm cwtone prefix '
+                  f'power maxpower mode micgain wpm cwtone prefix sidetone '
                   f'(bare "tx" shows all)')
     except ValueError:
         print(f'  bad value for tx {word}: {val!r}')
@@ -546,8 +561,39 @@ def _write_config(rx):
         print(f'    {k} = {params[k]}')
 
 
+def _setup_readline():
+    """Enable emacs-style line editing + persistent command history at the
+    sdr> prompt. input() uses readline automatically once it's imported;
+    this adds emacs keymap, a history file, and dedup. Best-effort — a missing
+    readline (e.g. minimal build) just falls back to plain input()."""
+    try:
+        import atexit
+        import os
+        import readline
+    except ImportError:
+        return
+    readline.parse_and_bind('set editing-mode emacs')   # C-a/C-e/C-k/C-r/…
+    readline.set_history_length(1000)
+    hist = os.path.expanduser('~/.config/solsdr/history')
+    try:
+        os.makedirs(os.path.dirname(hist), exist_ok=True)
+        if os.path.exists(hist):
+            readline.read_history_file(hist)
+    except OSError:
+        pass
+    atexit.register(lambda: _save_history(readline, hist))
+
+
+def _save_history(readline, path):
+    try:
+        readline.write_history_file(path)
+    except OSError:
+        pass
+
+
 def interactive_loop(rx):
     dual = len(rx.channels) > 1
+    _setup_readline()
     _print_help(dual)
     while True:
         try:
@@ -736,9 +782,11 @@ def main():
     ap.add_argument('--tx-watts', type=float, default=None,
                     help='TX output setpoint in watts for the raw-IQ TX server '
                          '(per-band calibration required)')
-    ap.add_argument('--max-power-watts', type=float, default=None,
-                    help='amp-protection output ceiling in watts for TX '
-                         '(clamps drive; refuses to key on an uncalibrated band)')
+    ap.add_argument('--max-power-watts', type=float, default=5.0,
+                    help='amp-protection output ceiling in watts for TX; also the '
+                         'default TX power when none is set (default 5 W). Clamps '
+                         'drive; refuses to key on an uncalibrated band. Pass 0 '
+                         'or a big number to effectively remove the ceiling.')
     # Unified transceiver: the digital-mode / TX bridge (virtual audio + real
     # rigctld + PTT->TXSession) runs IN THIS PROCESS by default, fed by the same
     # Radio via IQ fan-out. This makes solsdr one program that both RX and TX,
@@ -777,6 +825,9 @@ def main():
         ap.set_defaults(**good)
     args = ap.parse_args()
     setup_logging(args.log_level)
+    # --max-power-watts 0 (or negative) means "no ceiling".
+    if args.max_power_watts is not None and args.max_power_watts <= 0:
+        args.max_power_watts = None
 
     rx = AudioReceiver(args.freq_khz, mode=args.mode, device=args.device,
                        local_ip=args.local_ip, radio_ip=args.radio_ip,
@@ -825,25 +876,35 @@ def main():
     if args.control_api:
         from solsdr.api.control_api import ControlAPIServer
         c = ControlAPIServer(_RadioControlAdapter(rx), port=5556)
-        c.start(); servers.append(c)
-        print('control API on :5556')
+        try:
+            c.start(); servers.append(c)
+            print('control API on :5556')
+        except OSError as e:
+            # Now on by default, so a port clash (e.g. another solsdr already
+            # running) shouldn't kill startup — warn and carry on RX/TX-only.
+            print(f'control API not started ({e}); continuing without it. '
+                  f'(Another solsdr on :5556? use --no-control-api.)')
     if args.iq_server:
         from solsdr.api.iq_server import IQStreamServer
-        iqs = IQStreamServer(port=args.iq_port)
-        iqs.start(rate=rx.radio.wire_rate, freq=rx.freq_hz)
-        rx.channels[0].iq_sink = iqs.publish
-        servers.append(iqs)
-        print(f'RX1 IQ stream server on :{args.iq_port} (complex64 @ '
-              f'{rx.radio.wire_rate:.0f} Hz)')
-        # RX2 on its own port (default 5557; 5556 is the control API).
-        if args.rx2 is not None:
-            rx2_port = args.iq_port + 2 if args.iq_port == 5555 else args.iq_port + 1
-            iqs2 = IQStreamServer(port=rx2_port)
-            iqs2.start(rate=rx.radio.wire_rate, freq=rx.rx2_hz)
-            rx.channels[1].iq_sink = iqs2.publish
-            servers.append(iqs2)
-            print(f'RX2 IQ stream server on :{rx2_port} (complex64 @ '
+        try:
+            iqs = IQStreamServer(port=args.iq_port)
+            iqs.start(rate=rx.radio.wire_rate, freq=rx.freq_hz)
+            rx.channels[0].iq_sink = iqs.publish
+            servers.append(iqs)
+            print(f'RX1 IQ stream server on :{args.iq_port} (complex64 @ '
                   f'{rx.radio.wire_rate:.0f} Hz)')
+            # RX2 on its own port (default 5557; 5556 is the control API).
+            if args.rx2 is not None:
+                rx2_port = args.iq_port + 2 if args.iq_port == 5555 else args.iq_port + 1
+                iqs2 = IQStreamServer(port=rx2_port)
+                iqs2.start(rate=rx.radio.wire_rate, freq=rx.rx2_hz)
+                rx.channels[1].iq_sink = iqs2.publish
+                servers.append(iqs2)
+                print(f'RX2 IQ stream server on :{rx2_port} (complex64 @ '
+                      f'{rx.radio.wire_rate:.0f} Hz)')
+        except OSError as e:
+            print(f'IQ server not started ({e}); continuing without it. '
+                  f'(Another solsdr on :{args.iq_port}? use --no-iq-server.)')
     if args.iq_tx_server:
         from solsdr.api.iq_tx_server import IQTXServer
         txs = IQTXServer(rx.radio, port=args.iq_tx_port, mode=args.mode,

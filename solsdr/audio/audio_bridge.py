@@ -55,6 +55,8 @@ class AudioBridge:
         self.cw_char_wpm = 20.0
         self.cw_word_wpm = None    # None => standard (word == char)
         self.cw_tone_hz = 600.0
+        self.cw_sidetone = True    # play sent CW to the local speaker
+        self.sidetone_gain = 0.5
         self._tx = None            # active TXSession while keyed
         self._tx_lock = threading.Lock()
         self._keyed = False
@@ -144,6 +146,29 @@ class AudioBridge:
     def is_keyed(self):
         return self._keyed
 
+    # Conservative raw drive used when the operator has set NO power at all
+    # (no tx_watts, no amp ceiling). 64 ≈ ~6 W on the sqrt model — matches
+    # TXSession's safe default. This is the drive for `cw`/`tune` with no
+    # `tx power` set; it is NOT the ceiling (max_drive still bounds it).
+    DEFAULT_TX_DRIVE = 64
+
+    def _resolve_tx_drive(self, watts):
+        """Decide what to pass to TXSession.enter_tx as (watts, raw_drive).
+
+        Returns (watts_or_None, raw_drive_or_None). If a watts setpoint is known
+        (arg or self.tx_watts or the amp ceiling), use it. If NOTHING is set,
+        fall back to a MODEST raw drive (DEFAULT_TX_DRIVE) — otherwise enter_tx
+        would set no drive at all and the radio keys with drive 0 = NO RF (the
+        bug behind 'cw/tune with no tx power set produced nothing'). We use a
+        conservative default rather than max_drive so an unset power doesn't
+        silently transmit at full output."""
+        w = watts if watts is not None else self.tx_watts
+        if w is None:
+            w = self.max_power_watts        # honor an amp ceiling if that's set
+        if w is not None:
+            return float(w), None
+        return None, min(self.DEFAULT_TX_DRIVE, self.max_drive)
+
     def set_tx_watts(self, watts):
         """Set the TX output setpoint. Applies to a live (keyed) transmission
         immediately via the active TXSession, and to subsequent overs. `watts`
@@ -194,7 +219,7 @@ class AudioBridge:
             self._keyed = True
         try:
             from ..tx_session import TXSession
-            w = self.tx_watts if watts is None else float(watts)
+            w, raw = self._resolve_tx_drive(watts)
             mode = 'USB'                    # a tone in USB = a clean carrier offset
             stop = threading.Event()
 
@@ -217,7 +242,15 @@ class AudioBridge:
                 return False, f'tune refused: {reason}'
             tx.arm(confirm=True)
             self._tx = tx
-            tx.enter_tx(tone_iter(), watts=w, pa=False, prebuffer_s=0.1)
+            tx.enter_tx(tone_iter(), watts=w, raw_drive=raw, pa=False,
+                        prebuffer_s=0.1)
+            # Sidetone: a steady beep for the tuning duration.
+            if self.cw_sidetone:
+                n = int(self.audio_rate * seconds)
+                t = np.arange(n) / self.audio_rate
+                beep = (np.sin(2 * np.pi * self.cw_tone_hz * t)).astype(np.float32)
+                threading.Thread(target=self._play_sidetone, args=(beep,),
+                                 daemon=True).start()
             self._log(f'*** TUNE carrier: {seconds:g}s @ '
                       f'{("%.1f W" % w) if w is not None else "full drive"} ***')
             import time as _t
@@ -248,22 +281,33 @@ class AudioBridge:
         try:
             enc = CWEncoder(sample_rate=self.audio_rate, pitch=self.cw_tone_hz,
                             char_wpm=self.cw_char_wpm, word_wpm=self.cw_word_wpm)
-            audio = enc.encode(text).astype(np.float32)
-            if len(audio) == 0:
+            # TX: a KEYING ENVELOPE (no tone) -> CW mode -> carrier on the DIAL
+            # frequency exactly. The audible tone is a SEPARATE sidetone.
+            env = enc.envelope(text).astype(np.float32)
+            if len(env) == 0:
                 return False, 'no sendable characters in message'
 
-            # One-shot iterator: yield the encoded audio in modulator-sized
+            # CW sidetone: the audible tone at cw_tone_hz, played to the local
+            # speaker only — it does NOT go to the transmitter, so it can't shift
+            # the emitted frequency. Fire-and-forget; failure is non-fatal.
+            if self.cw_sidetone:
+                tone = enc.encode(text).astype(np.float32)
+                threading.Thread(target=self._play_sidetone,
+                                 args=(tone,), daemon=True).start()
+
+            # One-shot iterator: yield the keying envelope in modulator-sized
             # blocks, then a little trailing silence, then stop (ends the over).
+            audio = env
             block = self.audio_rate // 50
             def cw_iter():
                 for i in range(0, len(audio), block):
-                    yield self._apply_mic_gain(audio[i:i + block])
+                    yield audio[i:i + block]    # envelope: NO mic-gain (it's 0..1)
                 for _ in range(3):          # ~60 ms tail so the last dit clears
                     yield np.zeros(block, dtype=np.float32)
 
             from ..tx_session import TXSession
-            w = self.tx_watts if watts is None else float(watts)
-            tx = TXSession(self.radio, mode='USB', audio_rate=self.audio_rate,
+            w, raw = self._resolve_tx_drive(watts)
+            tx = TXSession(self.radio, mode='CW', audio_rate=self.audio_rate,
                            max_drive=self.max_drive,
                            max_power_watts=self.max_power_watts,
                            deadman_s=max(len(audio) / self.audio_rate + 5, 10),
@@ -278,7 +322,8 @@ class AudioBridge:
             self._log(f'*** CW TX: {len(text)} chars, ~{dur:.1f}s @ '
                       f'{self.cw_char_wpm:g}wpm'
                       f'{"/%gwpm Farnsworth" % self.cw_word_wpm if self.cw_word_wpm and self.cw_word_wpm < self.cw_char_wpm else ""} ***')
-            tx.enter_tx(cw_iter(), watts=w, pa=False, prebuffer_s=0.1)
+            tx.enter_tx(cw_iter(), watts=w, raw_drive=raw, pa=False,
+                        prebuffer_s=0.1)
             # Wait for the whole message (plus a margin) to pace out, then unkey.
             import time as _t
             _t.sleep(dur + 0.5)
@@ -288,6 +333,29 @@ class AudioBridge:
         finally:
             self._tx = None
             self._keyed = False
+
+    def _play_sidetone(self, audio):
+        """Play a mono float32 CW waveform to the local default output via pacat
+        (blocking write on its own thread). Best-effort; any failure is ignored
+        so it never affects transmit."""
+        import shutil
+        import subprocess
+        if shutil.which('pacat') is None:
+            return
+        pcm = np.clip(audio * self.sidetone_gain, -1.0, 1.0)
+        pcm = (pcm * 32767).astype('<i2').tobytes()
+        try:
+            p = subprocess.Popen(
+                ['pacat', '--playback', f'--rate={self.audio_rate}',
+                 '--channels=1', '--format=s16le',
+                 '--stream-name=solsdr-cw-sidetone'],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+            p.stdin.write(pcm)
+            p.stdin.close()
+            p.wait(timeout=len(audio) / self.audio_rate + 5)
+        except Exception:  # noqa: BLE001
+            pass
 
     def set_cw(self, char_wpm=None, word_wpm=None, tone_hz=None):
         """Set CW send parameters. char_wpm = element speed; word_wpm =
