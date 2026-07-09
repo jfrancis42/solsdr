@@ -110,8 +110,9 @@ class CWEncoder:
         n = int(round(seconds * self.sample_rate))
         return np.zeros(max(0, n), dtype=np.float64)
 
-    def encode(self, text):
-        """Return a float64 audio waveform (mono) of the text as CW."""
+    def _keyed(self, text, element_fn):
+        """Shared element sequencer. `element_fn(seconds)` renders one key-down
+        (a tone for audio, or a keying envelope for TX). Gaps are silence."""
         dot, dash, intra, char_gap, word_gap = self._timing()
         out = []
         text = text.upper().strip()
@@ -128,10 +129,36 @@ class CWEncoder:
                 for ei, el in enumerate(code):
                     if ei > 0:
                         out.append(self._silence(intra))
-                    out.append(self._tone(dot if el == '.' else dash))
+                    out.append(element_fn(dot if el == '.' else dash))
         if not out:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(out).astype(np.float32)
+
+    def encode(self, text):
+        """Return a float64 audio waveform (mono) of the text as CW — an audible
+        tone at `pitch`. Use for the SIDETONE (what the operator hears)."""
+        return self._keyed(text, self._tone)
+
+    def envelope(self, text):
+        """Return a real 0..1 KEYING ENVELOPE for the text (no carrier tone):
+        1.0 during elements with raised-cosine edges, 0.0 in gaps. This drives
+        the TX modulator's CW mode so the emitted carrier sits EXACTLY on the
+        dial frequency (no sidetone offset). Same timing/Farnsworth as encode()."""
+        return self._keyed(text, self._env_pulse)
+
+    def _env_pulse(self, seconds):
+        """A flat-topped keying pulse (amplitude 1.0) with raised-cosine on/off
+        ramps — the click-free CW envelope, carrier-free."""
+        n = int(round(seconds * self.sample_rate))
+        if n <= 0:
+            return np.zeros(0, dtype=np.float64)
+        env = np.ones(n, dtype=np.float64)
+        r = int(self.sample_rate * self.rise_ms / 1000.0)
+        if r > 0 and 2 * r < n:
+            ramp = 0.5 * (1 - np.cos(np.pi * np.arange(r) / r))
+            env[:r] = ramp
+            env[-r:] = ramp[::-1]
+        return env
 
 
 class CWDecoder:

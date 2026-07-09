@@ -77,3 +77,20 @@ if __name__ == '__main__':
     test_farnsworth_timing()
     test_full_rx_chain()
     print('\nCW TESTS PASSED')
+
+
+def test_cw_mode_on_frequency():
+    """CW mode must emit the carrier at BASEBAND DC (on the dial frequency),
+    driven by a keying envelope — NOT a tone offset by the sidetone pitch."""
+    from solsdr.dsp.modulator import Modulator
+    FS, WR = 48000, 39062.5
+    enc = CWEncoder(sample_rate=FS, pitch=700, char_wpm=20)
+    env = enc.envelope('E')
+    assert 0.0 <= float(env.min()) and 0.98 <= float(env.max()) <= 1.0, 'envelope not 0..1'
+    mod = Modulator(audio_rate=FS, wire_rate=WR, mode='CW')
+    iq = mod.process(np.ones(8192, dtype=np.float32))   # steady key-down
+    sp = np.abs(np.fft.fftshift(np.fft.fft(iq[:4096] * np.hanning(4096))))
+    fr = np.fft.fftshift(np.fft.fftfreq(4096, 1 / WR))
+    pk = fr[int(np.argmax(sp))]
+    assert abs(pk) < 50, f'CW carrier off dial freq by {pk:.1f} Hz (should be ~0)'
+    print(f'PASS CW on-frequency: carrier at {pk:+.1f} Hz baseband (700 Hz sidetone irrelevant)')
