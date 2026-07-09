@@ -142,9 +142,9 @@ class Demodulator:
         (width = cw_bandwidth), AM/FM symmetric about the dial."""
         m = mode.upper()
         if m == 'USB':
-            return (300.0, 2700.0)
+            return (100.0, 2700.0)
         if m == 'LSB':
-            return (-2700.0, -300.0)
+            return (-2700.0, -100.0)
         if m in ('CW', 'CWU', 'CWL'):
             half = max(25.0, self.cw_bandwidth / 2)
             return (-half, half)

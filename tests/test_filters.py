@@ -92,9 +92,9 @@ def test_demod_adjustable_passband():
         out = dem.process(iq[n // 2:])
         return float(np.sqrt(np.mean(out ** 2)) + 1e-12)
 
-    # defaults per mode
-    assert Demodulator(mode='USB').filter_lo == 300
-    assert Demodulator(mode='LSB').filter_hi == -300
+    # defaults per mode (SSB inner edge is 100 Hz)
+    assert Demodulator(mode='USB').filter_lo == 100
+    assert Demodulator(mode='LSB').filter_hi == -100
 
     # a 2000 Hz USB tone passes the default 300..2700 band but is rejected by a
     # narrow 300..1000 band. Unity gain (fixed:1) so the fixed_gain*clip doesn't

@@ -15,14 +15,19 @@ clients) are reflected here, and vice-versa. Controls need solsdr's control API
 
 Features
 --------
-  * Radio control (needs the control API): click the spectrum/waterfall to tune,
-    a mode dropdown, and a clickable frequency dial (click a digit's top to step
-    that decade up, bottom to step down; a "0" button zeroes below the kHz
-    decimal). Every control mirrors the radio's live state.
+  * Radio control (needs the control API), grouped into toolbar rows by function:
+      Row 1 (Radio):  mode dropdown, clickable frequency dial (click a digit's
+        top to step that decade up, bottom down; "0" zeroes below the kHz
+        decimal), filter bandwidth presets (CW 200/400/600 Hz, SSB 2.4/2.7/3.0
+        kHz + Custom), filter skirt sharpness (soft/normal/sharp), preamp.
+      Row 2 (RX DSP): AGC, manual gain, RIT, NR, NB, notch, APF, squelch.
+      Row 3 (Display): the view-only controls (below) — never touches the radio.
+    Every radio control mirrors the live state, so shell/other-client changes
+    move the widgets here and vice-versa. Also click the spectrum/waterfall to
+    tune.
   * Filter passband overlay: a translucent region shows the RX filter (drag its
-    edges on the spectrum to set the passband; RF offsets from the dial), a solid
-    line marks the exact dial frequency, and mode-aware bandwidth presets (CW
-    200/400/600 Hz, SSB 2.4/2.7/3.0 kHz, + Custom) sit in the DSP row.
+    edges on the spectrum to set the passband; RF offsets from the dial), and a
+    solid line marks the exact dial frequency.
   * Live FFT spectrum (top) + scrolling waterfall (bottom), sharing one
     absolute-frequency x-axis so a peak sits directly over its waterfall trace.
   * Frequency across the bottom (MHz), amplitude up the side (dBFS, or dBm with
@@ -116,6 +121,46 @@ KEY_ESCAPE = _qt("Key", "Key_Escape")
 
 # Modes the solsdr control API accepts (see api/control_api.py VALID_MODES).
 CONTROL_MODES = ["USB", "LSB", "AM", "FM", "CW"]
+# SSB filter skirt sharpness (matches Demodulator.SHARPNESS_PROFILES).
+SHARPNESS_CHOICES = ["soft", "normal", "sharp"]
+
+
+class TenthsAxisItem(pg.AxisItem):
+    """Frequency axis that adds MINOR tick marks at tenths of the labeled
+    (major) spacing — nine unlabeled subticks between each printed frequency.
+
+    We force exactly two tick levels: the major level pyqtgraph would normally
+    label, and a minor level at 1/10 of that spacing. The minor level's strings
+    are blanked so those ticks are bare marks (no clutter of numbers)."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self._minor_spacing = None
+
+    def tickValues(self, minVal, maxVal, size):
+        base = super().tickValues(minVal, maxVal, size)
+        if not base or not base[0][0] or base[0][0] <= 0:
+            self._minor_spacing = None
+            return base
+        major_spacing = base[0][0]
+        minor_spacing = major_spacing / 10.0
+        self._minor_spacing = minor_spacing
+        lo, hi = min(minVal, maxVal), max(minVal, maxVal)
+        import math
+        v = math.ceil(lo / minor_spacing) * minor_spacing
+        minor = []
+        while v <= hi and len(minor) < 2000:      # cap: runaway zoom-out guard
+            minor.append(v)
+            v += minor_spacing
+        # major (labeled) level first, then the finer minor level.
+        return [base[0], (minor_spacing, minor)]
+
+    def tickStrings(self, values, scale, spacing):
+        # blank the minor level (its spacing == major/10) so it draws bare ticks.
+        if (self._minor_spacing is not None
+                and abs(spacing - self._minor_spacing) < self._minor_spacing * 1e-6):
+            return ['' for _ in values]
+        return super().tickStrings(values, scale, spacing)
 
 
 def _qt_frameshape(member):
@@ -619,6 +664,12 @@ class Panadapter(QtWidgets.QMainWindow):
         # mode/frequency widgets command it too. All mirror the radio's live
         # state via the poll, so shell/other-client changes show up here.
         self.can_control = ctrl is not None and hasattr(ctrl, 'send_command')
+        # Radio-control widgets exist only when the control API is reachable
+        # (rows 1-2 are skipped otherwise); default them to None so display-only
+        # code paths and _sync_controls guards work without them.
+        self.cmb_mode = None
+        self.freq_dial = None
+        self.cmb_sharp = None
         # "pretty" = antialiased, filled, thicker trace (nice on a GPU/fast box).
         # Default is "fast": no antialias, thin trace, no fill — the software
         # rasterizer spends ~50 ms/frame on AA+fill of a 2048-point curve, vs
@@ -680,9 +731,15 @@ class Panadapter(QtWidgets.QMainWindow):
         vbox.setContentsMargins(6, 4, 6, 4)
         vbox.setSpacing(4)
 
-        vbox.addLayout(self._build_controls())
+        # Toolbar rows, grouped by function:
+        #   1. Radio  — tuning + receive filter (mode, freq, BW, skirt, preamp)
+        #   2. RX DSP — signal conditioning (AGC, gain, RIT, NR/NB/notch/APF/SQL)
+        #   3. Display — panadapter view only (scale, zoom, FFT, colors, ...)
+        # Rows 1-2 need the control API; row 3 is always shown.
         if self.can_control:
+            vbox.addLayout(self._build_radio_controls())
             vbox.addLayout(self._build_dsp_controls())
+        vbox.addLayout(self._build_display_controls())
 
         # info bar
         self.info = QtWidgets.QLabel("—")
@@ -695,9 +752,10 @@ class Panadapter(QtWidgets.QMainWindow):
         splitter = QtWidgets.QSplitter(VERTICAL)
         vbox.addWidget(splitter, 1)
 
-        # spectrum plot
+        # spectrum plot (custom bottom axis with tenths minor ticks)
         self.gl_spec = pg.GraphicsLayoutWidget()
-        self.p_spec = self.gl_spec.addPlot()
+        self.p_spec = self.gl_spec.addPlot(
+            axisItems={"bottom": TenthsAxisItem(orientation="bottom")})
         self.p_spec.showGrid(x=True, y=True, alpha=0.25)
         self.p_spec.setLabel("left", "level", units=self.unit)
         self.p_spec.setLabel("bottom", "frequency", units="Hz")
@@ -716,9 +774,10 @@ class Panadapter(QtWidgets.QMainWindow):
         self.peak_curve.setVisible(False)
         splitter.addWidget(self.gl_spec)
 
-        # waterfall plot (shares the spectrum's x-axis)
+        # waterfall plot (shares the spectrum's x-axis; same tenths axis)
         self.gl_wf = pg.GraphicsLayoutWidget()
-        self.p_wf = self.gl_wf.addPlot()
+        self.p_wf = self.gl_wf.addPlot(
+            axisItems={"bottom": TenthsAxisItem(orientation="bottom")})
         self.p_wf.setLabel("bottom", "frequency", units="Hz")
         self.p_wf.setLabel("left", "time")
         self.p_wf.getAxis("left").setStyle(showValues=False)
@@ -796,34 +855,89 @@ class Panadapter(QtWidgets.QMainWindow):
         self.cursor_lbl.setStyleSheet("QLabel{color:#9fb3c8;font-size:12px;}")
         vbox.addWidget(self.cursor_lbl)
 
-    def _build_controls(self):
+    @staticmethod
+    def _group_sep(row):
+        """Add a vertical separator between logical groups within a toolbar row."""
+        sep = QtWidgets.QFrame()
+        sep.setFrameShape(_qt_frameshape("VLine"))
+        sep.setStyleSheet("color:#ccc;")
+        row.addWidget(sep)
+
+    @staticmethod
+    def _group_label(row, text):
+        """Add a small bold group heading label within a toolbar row."""
+        lbl = QtWidgets.QLabel(text)
+        lbl.setStyleSheet("QLabel{color:#556;font-weight:bold;font-size:11px;}")
+        row.addWidget(lbl)
+
+    # -- row 1: radio tuning + receive filter --------------------------------
+    def _build_radio_controls(self):
+        """Row 1 — what you're RECEIVING: mode, frequency dial, filter bandwidth
+        presets, skirt sharpness, and preamp. All mirror the control-API status
+        both ways. Built only when the control API is reachable."""
         row = QtWidgets.QHBoxLayout()
         row.setSpacing(8)
 
-        # --- radio control: mode + clickable frequency dial ---
-        # Present only when we can reach the control API; otherwise this is a
-        # display and there's nothing to command. Both widgets mirror the live
-        # polled state (see _sync_controls) so shell/other-client changes show.
-        self.cmb_mode = None
-        self.freq_dial = None
-        if self.can_control:
-            self.cmb_mode = QtWidgets.QComboBox()
-            self.cmb_mode.addItems(CONTROL_MODES)
-            self.cmb_mode.setToolTip("Radio mode (mirrors the radio; changing it "
-                                     "commands the radio)")
-            self.cmb_mode.activated.connect(self._on_mode_pick)
-            row.addWidget(QtWidgets.QLabel("Mode"))
-            row.addWidget(self.cmb_mode)
+        # mode + clickable frequency dial
+        self.cmb_mode = QtWidgets.QComboBox()
+        self.cmb_mode.addItems(CONTROL_MODES)
+        self.cmb_mode.setToolTip("Radio mode (mirrors the radio; changing it "
+                                 "commands the radio)")
+        self.cmb_mode.activated.connect(self._on_mode_pick)
+        row.addWidget(QtWidgets.QLabel("Mode"))
+        row.addWidget(self.cmb_mode)
 
-            self.freq_dial = FrequencyDial()
-            self.freq_dial.tuned.connect(self._on_dial_tuned)
-            row.addWidget(self.freq_dial)
+        self.freq_dial = FrequencyDial()
+        self.freq_dial.tuned.connect(self._on_dial_tuned)
+        row.addWidget(self.freq_dial)
 
-            sep = QtWidgets.QFrame()
-            sep.setFrameShape(_qt_frameshape("VLine"))
-            sep.setStyleSheet("color:#ccc;")
-            row.addWidget(sep)
+        self._group_sep(row)
 
+        # filter bandwidth presets (mode-aware) + custom
+        row.addWidget(QtWidgets.QLabel("BW"))
+        self._bw_layout = QtWidgets.QHBoxLayout()
+        self._bw_layout.setSpacing(2)
+        self._bw_buttons = []
+        self._bw_mode = None
+        row.addLayout(self._bw_layout)
+        self.btn_bw_custom = QtWidgets.QPushButton("Custom")
+        self.btn_bw_custom.setFixedWidth(56)
+        self.btn_bw_custom.setToolTip("Set an exact filter bandwidth in Hz")
+        self.btn_bw_custom.clicked.connect(self._on_bw_custom)
+        row.addWidget(self.btn_bw_custom)
+        self._rebuild_bw_presets("USB")
+
+        # filter skirt sharpness
+        row.addWidget(QtWidgets.QLabel("Skirt"))
+        self.cmb_sharp = QtWidgets.QComboBox()
+        self.cmb_sharp.addItems(SHARPNESS_CHOICES)
+        self.cmb_sharp.setToolTip("SSB filter skirt sharpness: sharper = steeper "
+                                  "rolloff outside the passband, more latency")
+        self.cmb_sharp.activated.connect(self._on_sharp_pick)
+        row.addWidget(self.cmb_sharp)
+
+        self._group_sep(row)
+
+        # preamp / attenuator
+        row.addWidget(QtWidgets.QLabel("Preamp"))
+        self.cmb_preamp = QtWidgets.QComboBox()
+        for lbl in ("-20", "-10", "0", "+10"):
+            self.cmb_preamp.addItem(lbl)
+        self.cmb_preamp.setToolTip("RX preamp / attenuator (dB)")
+        self.cmb_preamp.activated.connect(self._on_preamp_pick)
+        row.addWidget(self.cmb_preamp)
+
+        row.addStretch(1)
+        return row
+
+    # -- row 3: display / view controls (no radio state) ---------------------
+    def _build_display_controls(self):
+        """Row 3 — panadapter VIEW only (never touches the radio): scale, zoom,
+        FFT size, averaging, peak-hold, DC, colormap, freeze. Always shown."""
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+
+        # amplitude scaling
         self.cb_auto = QtWidgets.QCheckBox("Auto-scale")
         self.cb_auto.setChecked(True)
         self.cb_auto.toggled.connect(self._on_auto)
@@ -834,23 +948,6 @@ class Panadapter(QtWidgets.QMainWindow):
                                     "(auto-rescale runs every few seconds)")
         self.btn_rescale.clicked.connect(self.rescale_now)
         row.addWidget(self.btn_rescale)
-
-        # frequency zoom
-        row.addWidget(QtWidgets.QLabel("Zoom"))
-        self.btn_zoom_out = QtWidgets.QPushButton("−")   # minus sign
-        self.btn_zoom_out.setToolTip("Zoom out (show more of the band)")
-        self.btn_zoom_out.setFixedWidth(30)
-        self.btn_zoom_out.clicked.connect(lambda: self.zoom_by(2.0))
-        row.addWidget(self.btn_zoom_out)
-        self.btn_zoom_in = QtWidgets.QPushButton("+")
-        self.btn_zoom_in.setToolTip("Zoom in (narrower span around the tuned freq)")
-        self.btn_zoom_in.setFixedWidth(30)
-        self.btn_zoom_in.clicked.connect(lambda: self.zoom_by(0.5))
-        row.addWidget(self.btn_zoom_in)
-        self.btn_zoom_full = QtWidgets.QPushButton("Full")
-        self.btn_zoom_full.setToolTip("Reset to the full IQ span")
-        self.btn_zoom_full.clicked.connect(self.zoom_full)
-        row.addWidget(self.btn_zoom_full)
 
         row.addWidget(QtWidgets.QLabel("Ref"))
         self.sp_ref = QtWidgets.QDoubleSpinBox()
@@ -870,6 +967,28 @@ class Panadapter(QtWidgets.QMainWindow):
         self.sp_range.valueChanged.connect(self._on_range)
         row.addWidget(self.sp_range)
 
+        self._group_sep(row)
+
+        # frequency zoom
+        row.addWidget(QtWidgets.QLabel("Zoom"))
+        self.btn_zoom_out = QtWidgets.QPushButton("−")   # minus sign
+        self.btn_zoom_out.setToolTip("Zoom out (show more of the band)")
+        self.btn_zoom_out.setFixedWidth(30)
+        self.btn_zoom_out.clicked.connect(lambda: self.zoom_by(2.0))
+        row.addWidget(self.btn_zoom_out)
+        self.btn_zoom_in = QtWidgets.QPushButton("+")
+        self.btn_zoom_in.setToolTip("Zoom in (narrower span around the tuned freq)")
+        self.btn_zoom_in.setFixedWidth(30)
+        self.btn_zoom_in.clicked.connect(lambda: self.zoom_by(0.5))
+        row.addWidget(self.btn_zoom_in)
+        self.btn_zoom_full = QtWidgets.QPushButton("Full")
+        self.btn_zoom_full.setToolTip("Reset to the full IQ span")
+        self.btn_zoom_full.clicked.connect(self.zoom_full)
+        row.addWidget(self.btn_zoom_full)
+
+        self._group_sep(row)
+
+        # FFT / averaging
         row.addWidget(QtWidgets.QLabel("FFT"))
         self.cmb_fft = QtWidgets.QComboBox()
         for n in (512, 1024, 2048, 4096, 8192):
@@ -886,6 +1005,9 @@ class Panadapter(QtWidgets.QMainWindow):
         self.sl_avg.valueChanged.connect(self._on_avg)
         row.addWidget(self.sl_avg)
 
+        self._group_sep(row)
+
+        # trace options
         self.cb_peak = QtWidgets.QCheckBox("Peak hold")
         self.cb_peak.toggled.connect(self._on_peak)
         row.addWidget(self.cb_peak)
@@ -911,14 +1033,12 @@ class Panadapter(QtWidgets.QMainWindow):
         row.addStretch(1)
         return row
 
-    # -- radio DSP controls (second toolbar row) -----------------------------
+    # -- row 2: RX DSP signal conditioning -----------------------------------
     def _build_dsp_controls(self):
-        """A second toolbar row for RX DSP / front-end controls: AGC, manual
-        gain, RIT, noise reduction, noise blanker, notch, audio-peak filter,
-        squelch, and preamp. Each mirrors the live control-API `status`, so a
-        change made in the shell (or another client) moves the widget here, and
-        moving it here commands the radio. (Backend: control_api status now
-        reports these fields; see _sync_dsp_controls.)"""
+        """Row 2 — RX DSP signal conditioning: AGC/gain, RIT, and the noise/notch
+        stages (NR, NB, notch, APF, squelch). Each mirrors the live control-API
+        `status`, so a shell/other-client change moves the widget here and moving
+        it here commands the radio. (Backend fields: see _sync_dsp_controls.)"""
         row = QtWidgets.QHBoxLayout()
         row.setSpacing(6)
         # guard flag: True while we're pushing polled state INTO a widget, so the
@@ -926,7 +1046,7 @@ class Panadapter(QtWidgets.QMainWindow):
         self._dsp_syncing = False
         self._dsp_labels = {}          # key -> value QLabel
 
-        # AGC mode dropdown
+        # --- gain / AGC / RIT ---
         row.addWidget(QtWidgets.QLabel("AGC"))
         self.cmb_agc = QtWidgets.QComboBox()
         self.cmb_agc.addItems(["auto", "on", "off"])
@@ -935,13 +1055,14 @@ class Panadapter(QtWidgets.QMainWindow):
         self.cmb_agc.activated.connect(self._on_agc_pick)
         row.addWidget(self.cmb_agc)
 
-        # manual audio gain (implies AGC off). Log-ish range 100..50000.
         self._add_dsp_slider(row, "Gain", "gain", lo=100, hi=50000, step=100,
                              tip="Fixed audio gain (turns AGC off)")
-        # RIT ±2 kHz
         self._add_dsp_slider(row, "RIT", "rit", lo=-2000, hi=2000, step=10,
                              suffix=" Hz", tip="Receiver incremental tuning")
-        # noise reduction / blanker / audio peak filter / squelch: 0..1
+
+        self._group_sep(row)
+
+        # --- noise / interference reduction ---
         for label, key, tip in (
                 ("NR", "nr", "Noise reduction (0 = off)"),
                 ("NB", "nb", "Noise blanker (0 = off)"),
@@ -949,40 +1070,8 @@ class Panadapter(QtWidgets.QMainWindow):
                 ("SQL", "squelch", "Squelch level (0 = open)")):
             self._add_dsp_slider(row, label, key, lo=0, hi=100, step=1,
                                  scale=0.01, tip=tip)
-        # notch: 0..5000 Hz (0 = off)
         self._add_dsp_slider(row, "Notch", "notch", lo=0, hi=5000, step=10,
                              suffix=" Hz", tip="Notch filter frequency (0 = off)")
-
-        # bandwidth presets (mode-aware: CW 200/400/600, SSB 2.4/2.7/3.0k) +
-        # a Custom button that prompts for an exact width in Hz. Buttons are
-        # rebuilt on mode change (_rebuild_bw_presets) and highlight-track the
-        # live width (_highlight_bw_preset).
-        row.addWidget(QtWidgets.QLabel("BW"))
-        self._bw_layout = QtWidgets.QHBoxLayout()
-        self._bw_layout.setSpacing(2)
-        self._bw_buttons = []
-        self._bw_mode = None
-        row.addLayout(self._bw_layout)
-        self.btn_bw_custom = QtWidgets.QPushButton("Custom")
-        self.btn_bw_custom.setFixedWidth(56)
-        self.btn_bw_custom.setToolTip("Set an exact filter bandwidth in Hz")
-        self.btn_bw_custom.clicked.connect(self._on_bw_custom)
-        row.addWidget(self.btn_bw_custom)
-        self._rebuild_bw_presets("USB")
-
-        sep2 = QtWidgets.QFrame()
-        sep2.setFrameShape(_qt_frameshape("VLine"))
-        sep2.setStyleSheet("color:#ccc;")
-        row.addWidget(sep2)
-
-        # preamp / attenuator dropdown
-        row.addWidget(QtWidgets.QLabel("Preamp"))
-        self.cmb_preamp = QtWidgets.QComboBox()
-        for lbl in ("-20", "-10", "0", "+10"):
-            self.cmb_preamp.addItem(lbl)
-        self.cmb_preamp.setToolTip("RX preamp / attenuator (dB)")
-        self.cmb_preamp.activated.connect(self._on_preamp_pick)
-        row.addWidget(self.cmb_preamp)
 
         row.addStretch(1)
         return row
@@ -1040,6 +1129,14 @@ class Panadapter(QtWidgets.QMainWindow):
         if not (reply and reply.startswith("OK")):
             self.cursor_lbl.setText(f"preamp failed: {reply or 'no reply'}")
 
+    def _on_sharp_pick(self, _idx):
+        s = self.cmb_sharp.currentText()
+        reply = self.ctrl.send_command(f"sharpness {s}")
+        if reply and reply.startswith("OK"):
+            self.cursor_lbl.setText(f"filter skirt -> {s}")
+        else:
+            self.cursor_lbl.setText(f"sharpness failed: {reply or 'no reply'}")
+
     def _sync_dsp_controls(self, st):
         """Mirror the polled `status` DSP fields into the second-row widgets
         WITHOUT emitting commands. Skips a widget whose dropdown is open or whose
@@ -1077,6 +1174,13 @@ class Panadapter(QtWidgets.QMainWindow):
                 if self.cmb_preamp.findText(str(pa)) >= 0 \
                         and self.cmb_preamp.currentText() != str(pa):
                     self.cmb_preamp.setCurrentText(str(pa))
+            # sharpness dropdown
+            sh = st.get("sharpness")
+            if (self.cmb_sharp is not None and sh is not None
+                    and sh in SHARPNESS_CHOICES
+                    and not self.cmb_sharp.view().isVisible()
+                    and self.cmb_sharp.currentText() != sh):
+                self.cmb_sharp.setCurrentText(sh)
         finally:
             self._dsp_syncing = False
 
@@ -1151,14 +1255,15 @@ class Panadapter(QtWidgets.QMainWindow):
             return
         mode = self.cmb_mode.currentText() if self.cmb_mode else "USB"
         w = float(width_hz)
+        edge = 100.0                           # SSB inner (low) edge, matches demod
         if mode == "LSB":
-            lo, hi = -(300.0 + w), -300.0     # keep the 300 Hz inner edge
+            lo, hi = -(edge + w), -edge        # keep the SSB inner edge
         elif mode in ("CW", "CWU", "CWL"):
             lo, hi = -w / 2.0, w / 2.0
         elif mode in ("AM", "FM"):
             lo, hi = -w / 2.0, w / 2.0
         else:                                  # USB and anything else
-            lo, hi = 300.0, 300.0 + w
+            lo, hi = edge, edge + w
         lo, hi = int(round(lo)), int(round(hi))
         reply = self.ctrl.send_command(f"filter {lo} {hi}")
         if reply and reply.startswith("OK"):
