@@ -5,6 +5,15 @@ is hardware-verified, the **DX** is not.
 
 ## Unreleased
 
+- **Text control API (:5556) is now ON BY DEFAULT** (loopback), matching
+  `--iq-server` — the panadapter and other clients read it for live
+  freq/mode/S-meter and to send commands. `--no-control-api` disables it.
+- **Virtual audio device naming from the shell.** `tx prefix <name>` renames the
+  bridge's PulseAudio devices live → `<name>-rx.monitor` (fldigi/WSJT-X **input**)
+  and `<name>-tx` (**output**); `tx` now shows the exact device names. Still
+  settable at launch with `--prefix`. Live rename drops apps bound to the old
+  names and is refused while transmitting.
+
 - **Renamed the main script** `solsdr_receiver.py` → `solsdr/cli.py` (it's a
   transceiver now, not a receiver). Run it as **`solsdr`** (installed; alias
   `solsdr-shell`) or **`python3 -m solsdr`** (from source). The old
