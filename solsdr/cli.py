@@ -295,6 +295,9 @@ dummy load, and obeys the amp-limit / calibration interlocks.
     tx wpm <c> [<w>]   CW send speed: element <c> wpm, optional Farnsworth
                        spacing <w> wpm (w<c). e.g. "tx wpm 25 15" = 15wpm@25
     tx cwtone <Hz>     CW send sidetone/pitch (default 600)
+    tx prefix <name>   rename the virtual audio devices live -> <name>-rx.monitor
+                       (fldigi/WSJT-X input) + <name>-tx (output). Drops apps
+                       bound to the old names. (Set at launch with --prefix.)
     tune [s] [W]       ⚠ KEY a CW tuning carrier: s sec (default 3),
                        W watts (default current power). e.g. "tune", "tune 5 3"
 
@@ -347,7 +350,11 @@ def _tx_command(rx, arg):
               f'{" / %g" % br.cw_word_wpm if br.cw_word_wpm else ""}'
               f'   (CW send: char/word; effective {eff:g}wpm{fw})')
         print(f'    cwtone   = {br.cw_tone_hz:g} Hz   (CW send sidetone/pitch)')
-        print(f'    device   = {br.devices.prefix!r} (PulseAudio prefix)')
+        d = br.devices
+        print(f'    prefix   = {d.prefix!r}')
+        print(f'      -> fldigi/WSJT-X INPUT  (RX audio): {d.rx_sink_name}.monitor'
+              f'  (or {d.rx_input_name})')
+        print(f'      -> fldigi/WSJT-X OUTPUT (TX audio): {d.tx_sink_name}')
         print(f'    monitor  = {br.monitor.sink or "off"}')
         return
     word = parts[0].lower()
@@ -398,9 +405,17 @@ def _tx_command(rx, arg):
                 print(f'  cwtone = {br.cw_tone_hz:g} Hz'); return
             br.set_cw(tone_hz=float(val))
             print(f'  tx cwtone -> {br.cw_tone_hz:g} Hz')
+        elif word == 'prefix':
+            if val is None:
+                print(f'  prefix = {br.devices.prefix!r}'); return
+            print(f'  renaming virtual audio devices to {val!r} — '
+                  f'apps bound to the old names will drop, repoint them.')
+            ok, msg = br.set_prefix(val)
+            print(f'  {msg}')
         else:
             print(f'  ? unknown tx setting {word!r}; try: '
-                  f'power maxpower mode micgain wpm cwtone (bare "tx" shows all)')
+                  f'power maxpower mode micgain wpm cwtone prefix '
+                  f'(bare "tx" shows all)')
     except ValueError:
         print(f'  bad value for tx {word}: {val!r}')
 
@@ -690,8 +705,14 @@ def main():
                          'from Hamlib / libhamlib-utils)')
     ap.add_argument('--hamlib-port', type=int, default=4532,
                     help='port for the rigctld launched by --hamlib (default 4532)')
-    ap.add_argument('--control-api', action='store_true',
-                    help='also run the text control API on :5556')
+    # Text control API is ON BY DEFAULT (loopback :5556) — the panadapter and
+    # other clients read it for live freq/mode/S-meter and to send commands.
+    # Matches --iq-server's default-on rationale. --no-control-api to disable.
+    ap.add_argument('--control-api', dest='control_api', action='store_true',
+                    default=True,
+                    help='text control API on :5556 (default: ON)')
+    ap.add_argument('--no-control-api', dest='control_api', action='store_false',
+                    help='disable the text control API (it is on by default)')
     # RX IQ streaming is ON BY DEFAULT — the panadapter, GNU Radio, recorders,
     # etc. all consume it, so binding the port is the normal case. Use
     # --no-iq-server to disable it (e.g. to free the port or reduce load).

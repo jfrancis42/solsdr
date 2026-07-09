@@ -262,7 +262,11 @@ drive on an in‑progress over). `--no-tx` reverts to a lean RX‑only program. 
 | `tx maxpower <W>` | `tx maxpower 5` | Amp‑protection ceiling (safety; next over only) |
 | `tx mode <m>` | `tx mode USB` | TX modulation mode |
 | `tx micgain <x>` | `tx micgain 1.5` | TX‑audio (mic) gain — applies live |
-| `tune [s] [W]` | `tune 5 3` | ⚠️ **Key a CW tuning carrier** for `s` sec (default 3) at `W` watts (default current power). The one shell command that transmits. |
+| `tx wpm <c> [w]` | `tx wpm 25 15` | CW send speed — element `c` wpm, optional Farnsworth spacing `w` wpm |
+| `tx cwtone <Hz>` | `tx cwtone 700` | CW send sidetone/pitch (default 600) |
+| `tx prefix <name>` | `tx prefix myrig` | Rename the virtual audio devices → `<name>-rx.monitor` (fldigi/WSJT‑X input) + `<name>-tx` (output). Also settable at launch with `--prefix`. |
+| `cw <text>` | `cw cq de n0gq` | ⚠️ **Transmit** text as Morse |
+| `tune [s] [W]` | `tune 5 3` | ⚠️ **Key a CW tuning carrier** for `s` sec (default 3) at `W` watts (default current power). |
 | `s` | `s` | Print S‑meter + full status line |
 | `ref ext\|int` | `ref ext` | External 10 MHz (GPSDO) vs internal reference |
 | `lpf on\|off` | `lpf on` | HF low‑pass filter relay |
@@ -312,8 +316,9 @@ solsdr 14074 --no-iq-server
 solsdr 14074 --iq-tx-server                        # wiring test, no RF
 solsdr 14074 --iq-tx-server --tx-arm --max-power-watts 5 --tx-watts 3
 
-# Everything at once: CAT + IQ (default) + text control API, wider 312.5 kHz IQ
-solsdr 14074 --hamlib --control-api --rate 312500
+# IQ + control API are ON BY DEFAULT; here just add a wider 312.5 kHz IQ rate
+solsdr 14074 --rate 312500
+# (disable a default server if you must: --no-iq-server / --no-control-api / --no-tx)
 
 # Dual-watch: RX1 20 m (audio + IQ :5555), RX2 40 m CW (IQ :5557)
 solsdr 14074 --rx2 7025 --rx2-mode CW
@@ -348,8 +353,8 @@ Python — PyQt5/PyQt6/PySide6 + pyqtgraph + numpy — no GNU Radio, no ExpertSD
 **Display only:** it never tunes or keys the radio.
 
 ```bash
-# on the radio host (RX IQ is on by default; add --control-api for the info bar):
-solsdr 14074 --control-api
+# on the radio host (RX IQ + control API are both on by default):
+solsdr 14074
 
 # then, anywhere that can reach it (needs a display; ssh -X for remote):
 python3 clients/panadapter.py --host 127.0.0.1

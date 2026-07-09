@@ -158,6 +158,24 @@ class JS8AudioBridge:
         audio block, so it applies live during a transmission."""
         self.mic_gain = max(0.0, float(g))
 
+    def set_prefix(self, prefix):
+        """Rename the virtual audio devices to <prefix>-rx / <prefix>-tx, live.
+        Recreates the PulseAudio sinks — any app bound to the old devices will
+        drop and must be repointed. Refused while transmitting. Returns
+        (ok, message)."""
+        prefix = str(prefix).strip()
+        if not prefix:
+            return False, 'empty prefix'
+        with self._tx_lock:
+            if self._keyed:
+                return False, 'transmitting — device rename refused'
+        try:
+            self.devices.set_prefix(prefix)
+        except Exception as e:  # noqa: BLE001
+            return False, f'rename failed: {e}'
+        return True, (f'audio devices now {prefix}-rx.monitor (RX) / '
+                      f'{prefix}-tx (TX) — repoint fldigi/WSJT-X/JS8Call')
+
     def tune_carrier(self, seconds=3.0, watts=None, tone_hz=1000.0):
         """Key a steady CW tuning carrier for `seconds`, then unkey.
 

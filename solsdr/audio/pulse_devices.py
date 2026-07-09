@@ -118,6 +118,20 @@ class PulseAudioDevices:
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self._mods = []
 
+    def set_prefix(self, prefix):
+        """Rename the virtual devices to a new prefix, tearing down and
+        recreating the PulseAudio sinks. WARNING: any app currently bound to the
+        old <prefix>-rx/-tx devices loses the connection and must be repointed."""
+        was_running = self.running
+        if was_running:
+            self.stop()
+        self.prefix = prefix
+        self.rx_sink_name = f'{prefix}-rx'
+        self.tx_sink_name = f'{prefix}-tx'
+        self.rx_input_name = f'{prefix}-rx-mic'
+        if was_running:
+            self.start()
+
     # -- RX: we write demodulated audio out ------------------------------
     def write_rx(self, audio: np.ndarray):
         """Write one block of real float32 audio (~[-1,1]) to the RX sink."""
