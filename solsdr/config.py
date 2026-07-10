@@ -9,8 +9,8 @@ Format is auto-detected by extension: JSON (`.json`), or a simple `key = value`
 INI-style/flat file (`.conf`/`.ini`/`.cfg` — no sections needed). Example
 `~/.config/solsdr/config.conf`:
 
-    radio_ip   = 10.1.2.3
-    local_ip   = 10.1.2.185
+    radio_ip   = 192.0.2.10
+    local_ip   = 192.0.2.20
     device     = 5
     variant    = PRO
     freq_khz   = 14074

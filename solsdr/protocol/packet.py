@@ -30,6 +30,17 @@ OP_IQ_TX_ACTIVE = 0xFD
 
 CTL_HDR_SIZE = 18
 
+# External-PTT edge packet: radio->host on 50002. Header `<magic> ff 01 1f` —
+# opcode 0x1F sits at byte 3 like the telemetry, but byte 2 is 0x01 here vs 0x00
+# for the streaming supply telemetry (see parse_telemetry). That byte-2 subtype
+# is the reliable discriminator; the two also differ in size (this one's UDP
+# payload is ~22 bytes, telemetry ~34). Verified on a PRO 2026-07-10: the radio
+# pushes one of these on every rear-panel PTT input edge, 3-13 ms before
+# ExpertSDR3 issues its own key command. PTT state is at payload offset 18
+# (0x01=pressed, 0x00=released).
+PTT_EDGE_SUBTYPE = 0x01     # byte 2 (telemetry is 0x00)
+PTT_EDGE_STATE_OFFSET = 18
+
 
 # --- 24-bit little-endian signed helpers (vectorized) ---------------------
 
@@ -223,8 +234,11 @@ def parse_telemetry(buf: bytes, magic: int = MAGIC_PRO):
     demod.s_meter). Returns None if not a telemetry frame or too short.
     """
     # Header is <magic> ff 00 1f — opcode 0x1F sits at byte 3 (byte 2 is 0x00),
-    # unlike the byte-2 opcode of the control packets.
-    if len(buf) < 22 or buf[0] != magic or buf[1] != 0xFF or buf[3] != 0x1F:
+    # unlike the byte-2 opcode of the control packets. Byte 2 MUST be 0x00: the
+    # external-PTT edge packet (parse_ptt_edge) shares byte3=0x1F but has byte2=
+    # 0x01, and must not be misread as supply telemetry.
+    if (len(buf) < 22 or buf[0] != magic or buf[1] != 0xFF
+            or buf[2] != 0x00 or buf[3] != 0x1F):
         return None
     fwd_raw = struct.unpack('<H', buf[8:10])[0]
     current = struct.unpack('<H', buf[14:16])[0] / 100.0
@@ -238,3 +252,44 @@ def parse_telemetry(buf: bytes, magic: int = MAGIC_PRO):
         # Forward-power indicator: 0 at RX, rises with TX output. Raw (uncal).
         'fwd_power_raw': fwd_raw,
     }
+
+
+def parse_ptt_edge(buf: bytes, magic: int = MAGIC_PRO):
+    """Decode an external-PTT edge packet -> True (pressed) / False (released),
+    or None if this isn't one.
+
+    Header `<magic> ff 01 1f` (byte 2 = 0x01 distinguishes it from the byte2=0x00
+    streaming telemetry that shares opcode 0x1F). PTT state is a byte at
+    PTT_EDGE_STATE_OFFSET: 0x01 = pressed (key down), 0x00 = released (key up).
+    Verified on a PRO 2026-07-10 — the radio emits one per rear-panel PTT edge.
+    """
+    if (len(buf) <= PTT_EDGE_STATE_OFFSET or buf[0] != magic or buf[1] != 0xFF
+            or buf[2] != PTT_EDGE_SUBTYPE or buf[3] != 0x1F):
+        return None
+    return buf[PTT_EDGE_STATE_OFFSET] != 0x00
+
+
+def decode_tx_audio_packet(packet: bytes, magic: int = MAGIC_PRO):
+    """Decode a downstream 0xFD frame (radio->host) into a MONO float32 audio
+    array, or None if it isn't a 0xFD frame.
+
+    While keyed with a front-panel mic, the radio digitizes the selected mic and
+    streams it DOWN in the SAME 1210-byte frame format as RX IQ but with opcode
+    0xFD (TX-active) and both channels carrying the SAME mono sample (verified:
+    I==Q on 100% of pairs, PRO 2026-07-10). We return the I channel (== Q) as
+    real mono audio at the radio wire rate, normalized to ~[-1, 1). Feed it to
+    the Modulator to transmit the operator's voice (host-side modulation).
+
+    Distinct from decode_iq_packet_rx (opcode 0xFE, RX IQ). The header layout is
+    identical otherwise, so we reuse the sample unpacking.
+    """
+    if len(packet) != IQ_PKT_SIZE:
+        return None
+    if packet[0] != magic or packet[1] != 0xFF or packet[2] != OP_IQ_TX_ACTIVE:
+        return None
+    payload = np.frombuffer(packet, dtype=np.uint8, count=IQ_PAYLOAD_SIZE,
+                            offset=IQ_HDR_SIZE)
+    pairs = payload.reshape(IQ_SAMPLES_PER_PKT, IQ_BYTES_PER_SAMPLE)
+    # Mono: I == Q, so decode just the I channel (bytes 3-5) and return it real.
+    i = _decode_24le_signed(pairs[:, 3:6]).astype(np.float32) / _FULL_SCALE
+    return i

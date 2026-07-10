@@ -16,31 +16,33 @@ IQ. It's built for **experimentation**:
   `TXSession`) for building your own receivers, transmitters, and measurements.
 
 > **The core use case is digital modes** (JS8Call, WSJT‑X, fldigi) and
-> software‑driven IQ/DSP — that's what solsdr is built and verified for. Voice
-> operation exists but is secondary: you can transmit SSB/phone by feeding a
-> **PC** mic into the TX audio device (see "Voice / SSB from a PC mic"), while
-> using the radio's **front‑panel Mic1/Mic2 jacks** is **not** supported yet and
-> is future work (see the feature table and TODO for why and what it would take).
+> software‑driven IQ/DSP — that's what solsdr is built and most heavily used for.
+> But **voice / SSB phone is also a first‑class transmit mode**, from a PC mic or
+> the radio's own **front‑panel Mic1/Mic2 jacks**, keyed by a footswitch,
+> spacebar, software, or CAT — all hardware‑verified on‑air (see "Voice / SSB").
 
-**A core design goal: solsdr has no GUI, by intent.** The entire SDR — every bit
-of its functionality — is a "front‑panel‑less" command‑line program, meant to be
-*remote‑controlled by other software* rather than operated by hand. There is no
-waterfall, no spectrum display, no knobs, dials, meters, or switches, and there
-never will be. Everything is driven over the network: Hamlib (`rigctld`),
-JS8Call, WSJT‑X, fldigi, GNU Radio, or your own scripts. If you want a
-point‑and‑click SDR console, this isn't it (use ExpertSDR3); solsdr is the
-headless engine that lets *other* tools use the radio without any of that.
+**Design: solsdr is engine‑first, GUI‑optional.** The core is a headless,
+"front‑panel‑less" command‑line engine meant to be *driven by other software*
+over the network — Hamlib (`rigctld`), JS8Call, WSJT‑X, fldigi, GNU Radio, or
+your own scripts — with an interactive `sdr>` shell for hands‑on control. It
+ships **no built‑in GUI in the core**, but a standalone **panadapter** client
+(`clients/panadapter.py`, PyQt/pyqtgraph) gives you a live spectrum + waterfall
+and a full click‑to‑tune control panel when you want one — it just talks to the
+same network interfaces (RX IQ server + control API) any other client would. So:
+run it fully headless as an engine, drive it from digital‑mode software, operate
+it by hand at the shell, or add the graphical panadapter — your choice.
 
 Author: **Jeff Francis, N0GQ**.
 
-> ### ⚠️ Alpha release
+> ### ⚠️ Maturity — beta core, alpha edges
 >
-> This is essentially an **alpha**. The core RX and TX paths work and are
-> hardware‑verified, but the project is young: expect rough edges, incomplete
-> coverage (VHF, the DX variant, antenna switching), and gaps in the docs.
-> Further **testing, refinement, enhancement, and documentation are
-> forthcoming.** Use it in that spirit — and always validate TX into a dummy
-> load before going on the air.
+> Maturity varies by feature. **RX1 + TX (CW, digital, and voice/SSB) are
+> beta‑quality** — hardware‑verified on‑air and exercised heavily. **RX2
+> (second receiver / dual‑watch) is still alpha** — it functions, but not all of
+> the plumbing around it is complete, so expect rough edges there. VHF, the DX
+> variant, and antenna switching are incomplete/unverified. The project is young;
+> **testing, refinement, enhancement, and documentation are ongoing.** Always
+> validate TX into a dummy load before going on the air.
 
 > ### Model support
 >
@@ -100,14 +102,18 @@ on‑air by JS8Call through the audio bridge. See **Transmit** below.
 | Tuning, live retune (no restart) | ✅ verified |
 | RX IQ streaming @ 39062.5 Hz + bidirectional keepalive | ✅ verified |
 | Selectable IQ rate 39062.5 / 78125 / 156250 / 312500 Hz | ✅ verified (FT8 decoded at 312.5 kHz) |
-| **RX2 second receiver** (independent freq/mode; dual-watch) | ✅ verified — interleaved on one stream, per-receiver demod/IQ; `--rx2 <kHz>` |
+| **RX2 second receiver** (independent freq/mode; dual-watch) | ⚠️ **alpha** — functions (interleaved on one stream, per-receiver demod/IQ; `--rx2 <kHz>`) but the surrounding plumbing is incomplete; rougher than RX1/TX |
 | RX1↔RX2 phase coherence (shared antenna) | ✅ measured **γ²≈0.999** — coherent dual-channel (DF/beamforming viable; see below) |
 | External 10 MHz reference (GPSDO) on/off | ✅ opcode verified (bytes identical to ExpertSDR3) |
 | Supply telemetry: voltage / current / temperature / forward‑power | ✅ `0x1F` fully decoded; shown in status (V/A, °F). Includes a forward‑power field (`fwd_power_raw`). No SWR is reported by the radio. Temperature is read‑only — the radio runs its own fan in firmware (no host setpoint) |
 | Front-end: HF.LPF, VHF.LNA toggles | ✅ opcodes verified (relay‑confirmed); `lpf`/`lna` shell cmds |
 | Mic source (Mic1/Mic2/PC) | ✅ verified (`0x21`); `mic` shell cmd. Mic gain is client‑side (no radio cmd) |
-| Front‑panel mic (Mic1/Mic2 jack) → on‑air voice | 🔬 **protocol verified, not yet implemented.** The radio digitizes the mic and streams it **up to the host** as `0xFD` frames (mono, in the IQ wrapper); the host modulates and streams TX IQ back down. Supporting it means reading that upstream mic audio into solsdr's `Modulator` — a receive‑side decode, not new TX. Until then, use a **PC** mic into the `solsdr-tx` sink (see "Voice / SSB from a PC mic"). See ARTEMISSDR.md §7. |
-| Radio's external/hardware PTT input (footswitch) | 🔬 **protocol verified, not yet implemented.** The radio pushes a `0x1F`/64‑byte edge packet (radio→host, :50002) on every external‑PTT transition — PTT state at payload offset 18 (`01`=pressed). solsdr can key from it alongside CAT PTT once decoded. See ARTEMISSDR.md §8. (No VOX.) |
+| **Voice / SSB phone** (pc / front‑panel mic1 / mic2 sources) | ✅ **hardware‑verified on‑air.** First‑class TX source with per‑source calibrated gain + comms voice shaping. See "Voice / SSB" below. |
+| Front‑panel mic (Mic1/Mic2 jack) → on‑air voice | ✅ **hardware‑verified 2026‑07‑10.** `tx source mic1`/`mic2`: the radio digitizes the mic and streams it back as `0xFD`; solsdr modulates it. See ARTEMISSDR.md §7. |
+| Radio's external/hardware PTT input (footswitch) | ✅ **hardware‑verified 2026‑07‑10.** `tx hwptt on`: the radio's `0x1F` edge packet keys/unkeys TX. Footswitch + hand‑mic PTT both work. See ARTEMISSDR.md §8. |
+| Per‑source mic calibration + comms voice shaping | ✅ `tx cal` (measure → gain), `tx shape flat/comms/dx` (band‑limit + speech compression), saved per source. |
+| Adjustable voice‑to‑RF latency | ✅ `tx latency <ms>` (default 120), live + saved. |
+| Software / spacebar PTT | ✅ `key`/`unkey`; `voice` = hold‑SPACE push‑to‑talk or tap‑ENTER latched. |
 | USB / LSB / AM / FM / CW demodulation + S‑meter | ✅ verified |
 | CW receive: BFO demod + Morse decoder | ✅ verified (synthetic full‑chain) |
 | Automatic reconnection on network loss | ✅ verified (simulated interruption) |
@@ -142,15 +148,6 @@ on‑air by JS8Call through the audio bridge. See **Transmit** below.
   responsibly and legally.
 - **VHF** — largely untested; deliberately never keyed during TX calibration.
 - **SunSDR2 DX** — profile is coded from ArtemisSDR but unverified on hardware.
-- **Front‑panel mic + hardware/external PTT — protocol reverse‑engineered
-  (2026‑07‑10), implementation pending.** Both are supportable; the wire behavior
-  is now known (see ARTEMISSDR.md §7–§8). The front‑panel mic is digitized and
-  streamed **up** to the host as `0xFD` frames (mono in the IQ wrapper) for the
-  host to modulate — so it's a receive‑side decode into the existing `Modulator`,
-  not new TX. The external PTT input is reported by a `0x1F`/64‑byte edge packet
-  (radio→host, PTT state at payload offset 18) that solsdr can key from alongside
-  CAT PTT. Not yet wired into solsdr. Meanwhile, transmit voice with a **PC mic
-  into `solsdr-tx`** (below).
 - **CW receive decode → shell** — the RX Morse decoder exists but decoded text
   isn't yet surfaced in the transceiver shell (planned). CW *transmit* is done
   (`cw <text>`).
@@ -220,37 +217,51 @@ flag names (argparse `dest`), so `--local-ip` → `local_ip`, `--radio-ip` →
 `radio_ip`, and so on. **Precedence: CLI flag > config file > built‑in default**,
 so a flag always wins over the file.
 
-Flat `key = value` format (`config.conf`) — values are auto‑typed (int/float/
-bool); `#` starts a comment:
-
-```ini
-# ~/.config/solsdr/config.conf
-radio_ip  = 10.1.2.3
-local_ip  = 10.1.2.185
-device    = 5
-variant   = PRO
-freq_khz  = 14074
-mode      = USB
-rate      = 39062.5
-ext_ref   = true
-log_level = info
-```
-
-Or JSON (`config.json`) if you prefer:
+JSON (`config.json`) — a minimal real‑world example (the author's station file):
 
 ```json
 {
-  "radio_ip": "10.1.2.3",
+  "freq_khz": 14074.0,
   "local_ip": "10.1.2.185",
-  "device": 5,
-  "freq_khz": 14074,
   "mode": "USB",
-  "ext_ref": true
+  "radio_ip": "10.1.2.3",
+  "tx_latency_ms": 120.0,
+  "tx_mode": "USB"
 }
 ```
 
-With that in place, `solsdr` (no args) tunes 20 m USB on the right radio; add a
-frequency to override just that: `solsdr 7074`. Point at a different file with
+`write-config` in the shell snapshots **all** current live settings into this
+file — after you calibrate mics and pick shapes, it grows to include the
+per‑source voice profiles, TX source, power, etc. A fuller flat `key = value`
+config (`config.conf`; values auto‑typed int/float/bool, `#` starts a comment):
+
+```ini
+# ~/.config/solsdr/config.conf
+radio_ip       = 10.1.2.3      # omit to broadcast‑discover the radio
+local_ip       = 10.1.2.185    # omit to bind all interfaces
+device         = 5
+variant        = PRO
+freq_khz       = 14074
+mode           = USB
+rate           = 39062.5
+ext_ref        = true
+log_level      = info
+# --- transmit / voice ---
+tx_mode        = USB
+tx_source      = pc            # pc | mic1 | mic2
+tx_hwptt       = false         # key from the radio's external PTT input
+tx_latency_ms  = 120           # voice->RF pre-buffer (lower = less delay)
+tx_watts       = 5
+max_power_watts = 10
+# per-source voice profiles (written by `tx cal` / `tx shape` / `write-config`)
+tx_src_pc_gain    = 2.3
+tx_src_pc_shape   = comms      # flat | comms | dx
+tx_src_pc_cal     = true
+tx_src_mic2_shape = flat
+```
+
+With a config in place, `solsdr` (no args) tunes 20 m USB on the right radio; add
+a frequency to override just that: `solsdr 7074`. Point at a different file with
 `--config /etc/solsdr/config.conf` (handy for the systemd service). Unknown keys
 are ignored with a warning, so a shared config can carry extra keys.
 
@@ -279,10 +290,18 @@ drive on an in‑progress over). `--no-tx` reverts to a lean RX‑only program. 
 | `tx power <W>` | `tx power 3` | TX output setpoint — **applies live while keyed** |
 | `tx maxpower <W>` | `tx maxpower 5` | Amp‑protection ceiling (safety; next over only) |
 | `tx mode <m>` | `tx mode USB` | TX modulation mode |
-| `tx micgain <x>` | `tx micgain 1.5` | TX‑audio (mic) gain — applies live |
+| `tx source <s>` | `tx source mic2` | Voice TX audio source: `pc` (the `‑tx` sink) / `mic1` / `mic2` (front‑panel mic). Each keeps its own gain + shape. |
+| `tx hwptt on\|off` | `tx hwptt on` | Key TX from the radio's external/footswitch PTT input |
+| `tx cal [s]` | `tx cal` | ⚠️ Calibrate the current source's mic gain (talk normally `s` s; mic1/mic2 **key the radio** to measure). Saved per source. |
+| `tx shape [src] <p>` | `tx shape pc comms` | Voice shaping preset: `flat`/`comms`/`dx` (band‑limit + speech compression). Per source. |
+| `tx gain [src] <x>` | `tx gain pc 2.3` | Manually set a source's input gain (marks it calibrated) |
+| `tx micgain <x>` | `tx micgain 1.5` | Extra TX‑audio gain, all sources — applies live |
+| `tx latency <ms>` | `tx latency 60` | Voice→RF pre‑buffer (lower = less delay hearing yourself; default 120). Live + saved. |
 | `tx wpm <c> [w]` | `tx wpm 25 15` | CW send speed — element `c` wpm, optional Farnsworth spacing `w` wpm |
 | `tx cwtone <Hz>` | `tx cwtone 700` | CW send sidetone/pitch (default 600) |
 | `tx prefix <name>` | `tx prefix myrig` | Rename the virtual audio devices → `<name>-rx.monitor` (fldigi/WSJT‑X input) + `<name>-tx` (output). Also settable at launch with `--prefix`. |
+| `key` / `unkey` | `key` | ⚠️ Software PTT: key / unkey TX with the current `tx source` (aliases `ptt`/`unptt`) |
+| `voice` | `voice` | ⚠️ Push‑to‑talk console: **HOLD SPACE** to talk, **tap ENTER** to latch on/off, `q`/`Esc` exits |
 | `cw <text>` | `cw cq de n0gq` | ⚠️ **Transmit** text as Morse |
 | `tune [s] [W]` | `tune 5 3` | ⚠️ **Key a CW tuning carrier** for `s` sec (default 3) at `W` watts (default current power). |
 | `s` | `s` | Print S‑meter + full status line |
@@ -303,11 +322,21 @@ drive on an in‑progress over). `--no-tx` reverts to a lean RX‑only program. 
 | `2 <cmd>` | `2 m CW` | Run a per‑receiver command against RX2 (e.g. `2 7074`) |
 | `q` | `q` | Quit |
 
-TX settings are **session‑live** — they take effect immediately but aren't saved
-unless you run `write-config`. To transmit, point a digital‑mode app (JS8Call /
-WSJT‑X / fldigi) at the bridge's virtual audio + rigctld exactly as before; the
-difference is it's now the same process as the receiver, so the shell sees and
-controls the transmit state directly.
+TX settings take effect immediately (live). They're saved to the config file
+with `write-config` and reloaded on startup — including per‑source mic gains,
+voice shaping, the TX source, hardware‑PTT enable, and `tx latency`. To transmit
+digital modes, point a digital‑mode app (JS8Call / WSJT‑X / fldigi) at the
+bridge's virtual audio + rigctld; it's the same process as the receiver, so the
+shell sees and controls the transmit state directly.
+
+**Pinning RX audio output (PipeWire).** `--device 5` is the `pipewire` device,
+which follows the *default* sink — so plugging in a USB mic/headset can steal
+your RX audio onto it. To pin RX to a fixed output regardless of hotplug, set
+`PULSE_SINK` to a stable sink name (from `pactl list short sinks`), e.g.:
+
+```bash
+PULSE_SINK=alsa_output.pci-0000_00_1b.0.analog-stereo solsdr
+```
 
 ---
 
@@ -560,41 +589,117 @@ speaker so you can hear glitches). If the app can't open the device, quit it,
 start the bridge first, then relaunch the app so it binds to the current
 PulseAudio nodes.
 
-### Voice / SSB from a PC mic (not the radio's front‑panel mic)
+## Voice / SSB — a first‑class TX source
 
-The radio's front‑panel Mic1/Mic2 jacks do **not** work for on‑air voice through
-solsdr — solsdr transmits IQ it modulates on the host, and never uses the radio's
-internal modulator (see the feature table). To operate phone, feed a mic
-attached to **the computer** into the `solsdr-tx` sink; solsdr modulates it
-(SSB/AM/FM per `--tx-mode` / `tx mode`) and streams the IQ to the radio, exactly
-like it does for JS8Call's audio.
+solsdr does SSB/AM/FM **phone** as a first‑class transmit mode, from any of three
+audio sources, keyed however you like. All of it is hardware‑verified on a PRO
+(on‑air, into a dummy load). solsdr transmits **host‑modulated IQ** — the mic
+audio (whichever source) runs through solsdr's own `Modulator` and is streamed to
+the radio as `0xFD` IQ — so voice, digital modes, and CW all share one TX chain
+and one set of safety interlocks.
 
-There is **no VOX**, so you supply PTT yourself — over **CAT**. With the bridge
-running, loop your mic's input source into the TX sink, then key/unkey via any
-Hamlib CAT client (the same `127.0.0.1:4532` rigctld the bridge launches):
+### Three TX audio sources (`tx source`)
+
+| Source | What it is | Notes |
+|--------|-----------|-------|
+| `pc`   | Audio on the `solsdr‑tx` PulseAudio sink — a computer mic routed in, or any app's output | Default. No RF needed to set up; calibrate any time. |
+| `mic1` | The radio's **front‑panel Mic1** jack | The radio digitizes the mic and streams it back to the host, which modulates it. Selecting it also sets the radio mic source. |
+| `mic2` | The radio's **front‑panel Mic2** jack (e.g. a Yaesu hand mic) | Same mechanism as mic1. |
+
+Set the source in the shell: `tx source pc` / `mic1` / `mic2`. Each source keeps
+its **own** calibrated gain and voice‑shaping preset (below), saved in the config
+file and re‑applied automatically when you switch — so a hand mic on mic2 and a
+studio USB mic on pc each "just work" at their own settings.
+
+### Keying: hardware PTT, software key, spacebar, or CAT
+
+There is **no VOX**; you key deliberately, any of these ways:
+
+- **Hardware PTT** — a footswitch or hand‑mic PTT wired to the radio's rear‑panel
+  PTT input. Turn it on with `tx hwptt on`; the radio reports each PTT edge to the
+  host and solsdr keys/unkeys from it.
+- **Software key** — `key` to transmit, `unkey` to stop (aliases `ptt`/`unptt`).
+- **`voice` (hands‑on‑keyboard)** — enter `voice` for a push‑to‑talk console:
+  **HOLD SPACE** to talk (release to unkey), or **tap ENTER** to toggle a latched
+  (hands‑free) over on/off; `q`/`Esc` exits. Uses the current `tx source`.
+- **CAT PTT** — any Hamlib client (JS8Call/WSJT‑X/fldigi/`rigctl`) with PTT = CAT
+  pointed at `127.0.0.1:4532` (this is how digital modes key).
+
+All of them fire the same interlocked `TXSession` (arming, dead‑man, drive
+ceiling, calibration‑gated amp limit). **Validate into a dummy load first.**
+
+### Connecting a USB / computer mic to `pc`
+
+`pc` transmits whatever is on the `solsdr‑tx` sink, so loop your mic into it. With
+the bridge running:
 
 ```bash
-# Send your PC mic (find the real source with: pactl list sources short)
-# into the TX sink the modulator reads:
-pactl load-module module-loopback \
-    source=<your_mic_source> sink=solsdr-tx latency_msec=30
+# Find your mic's PulseAudio source name:
+pactl list short sources          # e.g. alsa_input.usb-Blue_Microphones-00.analog-stereo
 
-# Key / unkey with rigctl (PTT edge -> the bridge arms/keys a TXSession):
-rigctl -m 2 -r 127.0.0.1:4532 \
-    - <<'CMD'
-T 1
-CMD
-# ...talk... then:  T 0   to unkey.
+# Route it into the TX sink the modulator reads (low latency):
+pactl load-module module-loopback \
+    source=alsa_input.usb-Blue_Microphones-00.analog-stereo \
+    sink=solsdr-tx latency_msec=30
+
+# In the solsdr shell:
+#   tx source pc
+#   tx cal            # calibrate your gain (talk normally ~4 s; no RF for pc)
+#   voice             # hold SPACE to talk
+
+# When done, unload the loopback (id is printed by load-module, or list it):
+pactl list short modules | grep loopback
+pactl unload-module <id>
 ```
 
-Any PTT source works as long as it drives that rigctld's PTT: a `T 1`/`T 0` from
-`rigctl`, a foot‑switch wired to a CAT app, or an app configured with **PTT =
-CAT** pointed at `127.0.0.1:4532`. When the bridge sees the CAT PTT‑on edge it
-arms a `TXSession`, and on PTT‑off it unkeys and RX resumes — the same interlocks
-(arming, dead‑man, drive ceiling, calibration‑gated amp limit) apply as for
-digital modes. Unload the loopback with
-`pactl unload-module <id>` when done. Use `--monitor <sink>` to hear the exact
-audio being modulated. **Validate into a dummy load first.**
+### Mic gain calibration (`tx cal`)
+
+Instead of guessing a mic‑gain number, **calibrate**: `tx cal` measures your
+normal speaking level for a few seconds and computes the gain that puts your
+voice at a sensible level with headroom. It's saved per source.
+
+- **`pc`** calibrates from the `solsdr‑tx` sink with **no transmit**.
+- **`mic1`/`mic2`** can only be measured *while transmitting* (the radio only
+  streams the front‑panel mic while keyed), so `tx cal` **keys the radio** for the
+  measurement window — **dummy load required**. It says so before keying.
+
+A calibrated source uses a **fixed** input gain (like a real rig's mic gain);
+an uncalibrated one falls back to auto‑leveling. You can also set a gain by hand:
+`tx gain [pc|mic1|mic2] <value>`.
+
+### Voice shaping for comms (`tx shape`)
+
+SSB is a communications mode, not hi‑fi. Each source has a shaping preset that
+band‑limits the audio and adds speech compression for intelligibility and talk
+power (a studio/USB mic picks up rumble, proximity bass and sibilance that just
+waste your ~3 kHz of SSB bandwidth):
+
+| Preset | Band | Compression | For |
+|--------|------|-------------|-----|
+| `flat`  | 300–2700 Hz | none  | a mic already voiced for comms (Yaesu hand mic) |
+| `comms` | 250–2800 Hz | 6 dB  | studio / USB mics (default for mic1 & pc) |
+| `dx`    | 350–2700 Hz | 12 dB | maximum readability in a pileup (punchy) |
+
+Set per source: `tx shape pc comms`, `tx shape mic2 flat`, etc. Defaults: mic2 =
+`flat`, mic1/pc = `comms`.
+
+### Latency (`tx latency`)
+
+The voice‑to‑RF delay (how long until you hear yourself on a monitor receiver) is
+dominated by the IQ pre‑buffer ahead of the transmit pacer. Default **120 ms**;
+lower it for less delay, raise it if you hear clicks/gaps:
+
+```
+tx latency 60         # 60 ms — snappier, more underrun risk
+tx latency 250        # safer on a loaded box
+```
+
+Saved in config as `tx_latency_ms`. Front‑panel mic (mic1/mic2) audio arrives
+over the network, so it may need a slightly higher value than a local `pc` mic
+before it's click‑free.
+
+Use `--monitor <sink>` (or `tx` to see all settings) to hear the exact audio
+being modulated while you dial these in.
 
 ---
 

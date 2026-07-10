@@ -334,9 +334,21 @@ class ControlAPIServer:
                 # control object exposes it (mock radio doesn't), keeping the
                 # API decoupled from any concrete implementation.
                 extra = self._dsp_status_fields()
+                # Supply telemetry (if the radio reports it): forward-power raw
+                # is the built-in "am I making RF" indicator (0 at RX, rises on
+                # TX), so a client can confirm transmit remotely.
+                tlm = getattr(self.radio, 'telemetry', None)
+                tlm_str = ''
+                if tlm:
+                    try:
+                        tlm_str = (f' fwd_power_raw={int(tlm.get("fwd_power_raw", 0))}'
+                                   f' volts={float(tlm.get("voltage", 0)):.1f}'
+                                   f' amps={float(tlm.get("current", 0)):.2f}')
+                    except (ValueError, TypeError):
+                        tlm_str = ''
                 return (f'OK freq={freq} mode={mode} '
                         f'ptt={"on" if s["ptt"] else "off"} '
-                        f'power={s["power"]} streaming={streaming}{sm_str}{extra}')
+                        f'power={s["power"]} streaming={streaming}{sm_str}{extra}{tlm_str}')
             return f'ERR unknown command: {cmd}'
         except ValueError as e:
             return f'ERR bad argument: {e}'

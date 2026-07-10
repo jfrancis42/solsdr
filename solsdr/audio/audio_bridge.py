@@ -16,6 +16,7 @@ The app controls the radio entirely through Hamlib. This bridge only moves
 audio and reacts to PTT — it does not tune or set mode itself (it mirrors the
 radio's current mode into the demod/mod so the sideband matches).
 """
+import queue
 import threading
 import time
 
@@ -62,6 +63,36 @@ class AudioBridge:
         self._keyed = False
         self._running = False
         self._external_iq = False  # True => fed by feed_iq(), not own start_stream
+
+        # --- voice TX: source + hardware-PTT wiring -----------------------
+        # tx_source selects where the TRANSMIT audio comes from:
+        #   'pc'   — the <prefix>-tx PulseAudio sink (JS8Call/WSJT-X/a PC mic
+        #            routed in). Audio arrives at audio_rate; the Modulator
+        #            resamples to wire_rate. This is the default/original path.
+        #   'mic1'/'mic2' — the radio's FRONT-PANEL mic. The radio digitizes it
+        #            and streams it back to us as downstream 0xFD frames (mono at
+        #            the WIRE rate); we modulate those. Selecting mic1/mic2 also
+        #            sets the radio mic source (0x21).
+        self.tx_source = 'pc'
+        # Front-panel mic audio queue, filled by on_tx_audio() from the radio
+        # RX loop, drained by the mic TX iterator. Bounded so a stall drops old
+        # audio rather than growing without limit.
+        self._mic_q = queue.Queue(maxsize=400)   # ~2 s at 195 pkt/s
+        # Hardware (external/footswitch) PTT: when enabled, a radio PTT-edge
+        # packet keys/unkeys TX (like a CAT PTT edge would).
+        self.hw_ptt_enabled = False
+        # Per-source audio profiles (gain + voice shaping), calibrated and
+        # persisted per source. Applied to the modulator at key time.
+        from .source_profiles import SourceProfiles
+        self.source_profiles = SourceProfiles()
+        # Live peak meter for calibration: when armed, on_mic_audio / the PC
+        # read path record the running peak of the RAW source audio.
+        self._meter_on = False
+        self._meter_peak = 0.0
+        # Voice TX latency: IQ pre-buffer ahead of the pacer (s) — the dominant
+        # voice->RF delay. Low for live voice; live-adjustable via set_feed_ahead.
+        from ..tx_session import TXSession as _TXS
+        self.tx_feed_ahead_s = _TXS.DEFAULT_FEED_AHEAD_S
 
     def _log(self, msg):
         if self.verbose:
@@ -124,6 +155,42 @@ class AudioBridge:
                 self.monitor.play(chunk)
                 yield chunk
 
+    def _mic_audio_iter(self):
+        """Yield front-panel-mic audio blocks (mono float32 at the WIRE rate)
+        for the modulator, drained from the queue on_mic_audio() fills.
+
+        The radio only streams mic audio AFTER we key (0xFD replaces RX on
+        50002), so unlike the PC path we can't block for 'first real audio'
+        before keying — the key must come first. We therefore key with a 0 s
+        prebuffer and let this iterator feed as packets arrive, emitting short
+        silence on a brief underrun so the pacer never starves."""
+        # One radio IQ packet worth of samples per block keeps latency minimal.
+        from ..protocol import packet as pk
+        silence = np.zeros(pk.IQ_SAMPLES_PER_PKT, dtype=np.float32)
+        n_frames = 0
+        n_silence = 0
+        peak = 0.0
+        while self._keyed:
+            try:
+                blk = self._mic_q.get(timeout=0.05)
+            except queue.Empty:
+                n_silence += 1
+                self.monitor.play(silence)
+                yield silence
+                continue
+            n_frames += 1
+            if n_frames == 1:
+                self._log('mic: first downstream audio frame received — modulating')
+            blk = self._apply_mic_gain(blk)
+            peak = max(peak, float(np.max(np.abs(blk))) if len(blk) else 0.0)
+            if n_frames % 200 == 0:      # ~1/sec at 195 pkt/s
+                self._log(f'mic: {n_frames} frames fed, {n_silence} underruns, '
+                          f'peak={peak:.3f}')
+            self.monitor.play(blk)
+            yield blk
+        self._log(f'mic: iterator ended — {n_frames} frames fed, '
+                  f'{n_silence} underruns, peak={peak:.3f}')
+
     def _apply_mic_gain(self, block):
         """Scale TX audio by the live mic-gain multiplier (1.0 = unity). Clip to
         [-1, 1] so a high gain can't overflow the modulator's input leveling.
@@ -134,13 +201,130 @@ class AudioBridge:
         return np.clip(block * g, -1.0, 1.0).astype(np.float32)
 
     def set_ptt(self, on: bool):
-        """PTT edge from the Hamlib client. Key/unkey a TXSession around the
-        app's transmit period. Idempotent per edge."""
+        """PTT edge from the Hamlib client OR a software key (shell `key`/`unkey`,
+        `voice` mode). Key/unkey a TXSession around the transmit period.
+        Idempotent per edge."""
         with self._tx_lock:
             if on and not self._keyed:
                 self._key()
             elif not on and self._keyed:
                 self._unkey()
+
+    # -- front-panel mic + hardware PTT -----------------------------------
+    def on_mic_audio(self, mono):
+        """Radio callback: one block of downstream front-panel-mic audio (mono
+        float32 at the WIRE rate). Only meaningful while keyed on a mic source;
+        enqueue for the mic TX iterator. Dropped otherwise. Non-blocking: on a
+        full queue, discard the oldest so we never stall the radio RX loop."""
+        if not (self._keyed and self.tx_source in ('mic1', 'mic2')):
+            return
+        if self._meter_on and len(mono):
+            self._meter_peak = max(self._meter_peak, float(np.max(np.abs(mono))))
+        try:
+            self._mic_q.put_nowait(mono)
+        except queue.Full:
+            try:
+                self._mic_q.get_nowait()      # drop oldest
+                self._mic_q.put_nowait(mono)
+            except queue.Empty:
+                pass
+
+    def on_hw_ptt(self, pressed: bool):
+        """Radio callback: the external/hardware PTT input changed state. Keys
+        or unkeys TX if hardware PTT is enabled; otherwise ignored (so a stray
+        footswitch can't transmit unless the operator opted in)."""
+        if not self.hw_ptt_enabled:
+            return
+        self._log(f'hardware PTT {"pressed" if pressed else "released"}')
+        self.set_ptt(pressed)
+
+    def set_hw_ptt(self, enabled: bool):
+        """Enable/disable keying from the radio's external PTT input."""
+        self.hw_ptt_enabled = bool(enabled)
+        return self.hw_ptt_enabled
+
+    def set_tx_source(self, source: str):
+        """Select the transmit audio source: 'pc' (the <prefix>-tx sink) or
+        'mic1'/'mic2' (the radio's front-panel mic, streamed back to us).
+        Selecting a front-panel mic also sets the radio mic source (0x21).
+        Refused while keyed. Returns (ok, message)."""
+        s = str(source).strip().lower()
+        if s not in ('pc', 'mic1', 'mic2'):
+            return False, f'unknown tx source {source!r} (pc | mic1 | mic2)'
+        with self._tx_lock:
+            if self._keyed:
+                return False, 'transmitting — change source after unkey'
+            self.tx_source = s
+        if s in ('mic1', 'mic2'):
+            try:
+                self.radio.set_mic_source(s)
+            except Exception as e:  # noqa: BLE001
+                return False, f'set source {s} but radio mic-source cmd failed: {e}'
+            prof = self.source_profiles.get(s)
+            return True, (f'TX source -> {s} (front-panel mic; radio digitizes it '
+                          f'and streams it back). profile: {prof}')
+        prof = self.source_profiles.get('pc')
+        return True, f'TX source -> pc ({self.devices.tx_sink_name} sink). profile: {prof}'
+
+    # -- per-source audio profile (gain + shaping), calibrated + persisted ---
+    def set_source_gain(self, source, gain):
+        """Manually set a source's input gain (marks it calibrated so the fixed
+        gain / no-auto-level path is used). Returns (ok, message)."""
+        if source not in ('mic1', 'mic2', 'pc'):
+            return False, f'unknown source {source!r}'
+        p = self.source_profiles.set_gain(source, gain)
+        p.calibrated = True
+        return True, f'{source} gain -> {p.gain:.3g} (calibrated; auto-level off)'
+
+    def set_source_shape(self, source, shape):
+        """Set a source's voice-shaping preset (flat/comms/dx). (ok, message)."""
+        if source not in ('mic1', 'mic2', 'pc'):
+            return False, f'unknown source {source!r}'
+        if not self.source_profiles.set_shape(source, shape):
+            from .source_profiles import SHAPE_PRESETS
+            return False, (f'unknown shape {shape!r} '
+                           f'(choices: {", ".join(SHAPE_PRESETS)})')
+        return True, f'{source} shape -> {shape}'
+
+    def start_source_meter(self):
+        """Begin measuring the raw peak of the current source's audio (for
+        calibration). PC audio flows from the -tx sink without keying; mic1/mic2
+        only stream while KEYED, so the caller must key for those."""
+        self._meter_peak = 0.0
+        self._meter_on = True
+
+    def read_pc_peak_block(self):
+        """Sample any buffered PC-source (-tx sink) audio into the meter peak.
+        No-op unless metering is on and the source is 'pc'. Call repeatedly
+        during a PC calibration window."""
+        if not (self._meter_on and self.tx_source == 'pc'):
+            return
+        blk = self.devices.read_tx(self.audio_rate // 20)   # ~50 ms
+        if blk is not None and len(blk):
+            self._meter_peak = max(self._meter_peak, float(np.max(np.abs(blk))))
+
+    def finish_source_calibration(self, source=None):
+        """Stop metering and compute+store the calibrated gain for `source`
+        (default: current source) from the measured peak. Returns (ok, message)."""
+        self._meter_on = False
+        src = source or self.tx_source
+        peak = self._meter_peak
+        ok, res = self.source_profiles.calibrate_from_peak(src, peak)
+        if not ok:
+            return False, res
+        from .source_profiles import CAL_TARGET_PEAK
+        return True, (f'{src} calibrated: measured peak {peak:.3f} -> gain '
+                      f'{res:.3g} (targets {int(CAL_TARGET_PEAK*100)}% peak; '
+                      f'auto-level now off for {src})')
+
+    def load_source_profiles(self, cfg):
+        """Replace the source profiles from a flat config dict."""
+        from .source_profiles import SourceProfiles
+        self.source_profiles = SourceProfiles.from_config(cfg)
+
+    def source_profiles_config(self):
+        """Flat config dict of all source profiles (for persistence)."""
+        return self.source_profiles.to_config()
 
     # -- live TX-setting control (used by the unified shell) ----------------
     def is_keyed(self):
@@ -182,6 +366,17 @@ class AudioBridge:
         """Set the TX-audio (mic) gain multiplier; takes effect on the next
         audio block, so it applies live during a transmission."""
         self.mic_gain = max(0.0, float(g))
+
+    def set_feed_ahead(self, seconds):
+        """Set the voice TX IQ pre-buffer (s) — the dominant voice->RF latency.
+        Applies to the LIVE session immediately and to subsequent overs. Lower
+        = less delay but more click/gap risk if the feed thread is descheduled.
+        Returns the clamped value."""
+        self.tx_feed_ahead_s = max(0.02, min(float(seconds), 2.0))
+        with self._tx_lock:
+            if self._tx is not None:
+                self._tx.set_feed_ahead(self.tx_feed_ahead_s)
+        return self.tx_feed_ahead_s
 
     def set_prefix(self, prefix):
         """Rename the virtual audio devices to <prefix>-rx / <prefix>-tx, live.
@@ -373,24 +568,76 @@ class AudioBridge:
         from ..tx_session import TXSession
         mode = self.radio.current_mode or self.tx_mode
         self._keyed = True
-        self.devices.flush_tx()  # drop pre-key audio
-        tx = TXSession(self.radio, mode=mode, audio_rate=self.audio_rate,
-                       realtime=True, max_drive=self.max_drive,
-                       max_power_watts=self.max_power_watts,
-                       verbose=self.verbose)
-        tx.arm(confirm=True)
         # Power setpoint: use tx_watts if set, else the amp ceiling, else full
         # drive. The TXSession clamps to max_power_watts regardless.
         watts = self.tx_watts if self.tx_watts is not None \
             else self.max_power_watts
+
+        if self.tx_source in ('mic1', 'mic2'):
+            # FRONT-PANEL MIC: the radio streams the mic audio back to us at the
+            # WIRE rate once we key, so the modulator's "audio rate" IS the wire
+            # rate (identity resample). We must key FIRST (mic audio only starts
+            # flowing after MOX-on / 0xFD-replaces-RX), so prebuffer_s=0 and the
+            # iterator feeds silence until the first mic packet arrives.
+            self._drain_mic_q()
+            tx = TXSession(self.radio, mode=mode, audio_rate=int(self.radio.wire_rate),
+                           realtime=True, max_drive=self.max_drive,
+                           max_power_watts=self.max_power_watts,
+                           feed_ahead_s=self.tx_feed_ahead_s,
+                           verbose=self.verbose)
+            tx.arm(confirm=True)
+            tx.enter_tx(self._mic_audio_iter(), watts=watts, pa=False,
+                        prebuffer_s=0.0)
+            self._apply_profile_to_tx(tx)
+            self._tx = tx
+            self._log(f'PTT ON — TX keyed ({mode}, {self.tx_source} front-panel mic, '
+                      f'{("%.1f W" % watts) if watts is not None else "full drive"})')
+            return
+
+        # PC path (default): audio from the <prefix>-tx sink at audio_rate.
+        self.devices.flush_tx()  # drop pre-key audio
+        tx = TXSession(self.radio, mode=mode, audio_rate=self.audio_rate,
+                       realtime=True, max_drive=self.max_drive,
+                       max_power_watts=self.max_power_watts,
+                       feed_ahead_s=self.tx_feed_ahead_s,
+                       verbose=self.verbose)
+        tx.arm(confirm=True)
         # Small prebuffer: live audio, so we want low app-to-RF latency. The
         # iterator blocks for the first real audio, so the modulator's buffer
         # fills with signal (not silence) and we key promptly once audio flows.
         tx.enter_tx(self._tx_audio_iter(), watts=watts, pa=False,
                     prebuffer_s=0.05)
+        self._apply_profile_to_tx(tx)
         self._tx = tx
-        self._log(f'PTT ON — TX keyed ({mode}, '
+        self._log(f'PTT ON — TX keyed ({mode}, PC audio, '
                   f'{("%.1f W" % watts) if watts is not None else "full drive"})')
+
+    def _drain_mic_q(self):
+        """Empty the front-panel-mic queue so a new over starts fresh (no stale
+        pre-key audio), mirroring devices.flush_tx() on the PC path."""
+        try:
+            while True:
+                self._mic_q.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _apply_profile_to_tx(self, tx):
+        """Apply the active source's audio profile (voice shaping + gain/leveling
+        policy) to a keyed TXSession's modulator. A CALIBRATED source uses its
+        fixed gain with auto-leveling OFF (output tracks the voice); an
+        UNCALIBRATED source keeps auto-leveling ON as a safety net. Called right
+        after enter_tx() builds the modulator."""
+        prof = self.source_profiles.get(self.tx_source)
+        try:
+            tx.mod.set_shape(prof.shape)
+            if prof.calibrated:
+                tx.mod.set_input(gain=prof.gain, leveling=False)
+            else:
+                tx.mod.set_input(leveling=True)
+        except Exception as e:  # noqa: BLE001
+            self._log(f'profile apply error: {e}')
+        self._log(f'source {self.tx_source}: {prof} '
+                  f'(leveling {"off" if prof.calibrated else "on"})')
 
     def _unkey(self):
         self._keyed = False
@@ -414,6 +661,11 @@ class AudioBridge:
         # Keep the demod's sideband synced to the radio's mode on the fly (the
         # poller calls radio.set_mode when the app changes mode).
         self._install_mode_hook()
+        # Wire the radio's front-panel-TX callbacks: hardware PTT edges and
+        # downstream mic audio. Both are no-ops until the operator selects a mic
+        # source / enables hardware PTT.
+        self.radio.on_ptt_edge = self.on_hw_ptt
+        self.radio.on_tx_audio = self.on_mic_audio
         self._external_iq = external_iq
         if not external_iq:
             self.radio.start_stream(self._on_iq)
@@ -446,6 +698,12 @@ class AudioBridge:
 
     def stop(self):
         self._running = False
+        # Detach radio callbacks so a lingering RX loop can't call back into a
+        # stopped bridge.
+        if getattr(self.radio, 'on_ptt_edge', None) is self.on_hw_ptt:
+            self.radio.on_ptt_edge = None
+        if getattr(self.radio, 'on_tx_audio', None) is self.on_mic_audio:
+            self.radio.on_tx_audio = None
         with self._tx_lock:
             if self._keyed:
                 self._unkey()

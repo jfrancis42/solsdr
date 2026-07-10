@@ -49,10 +49,16 @@ class TXSession:
     # uncalibrated (belt-and-suspenders behind tx_permitted()'s refusal).
     UNCAL_SAFE_DRIVE = 8
 
+    # Default IQ pre-buffer ahead of the pacer, in seconds. This is the dominant
+    # voice->RF latency. 0.12 s is a good low-latency default for live voice that
+    # still absorbs normal scheduling jitter; raise it if you hear clicks/gaps.
+    DEFAULT_FEED_AHEAD_S = 0.12
+
     def __init__(self, radio, mode='USB', audio_rate=48000, realtime=True,
                  power_cal: Optional[TXPowerCal] = None, verbose=True,
                  loopback_dest=None, max_drive=DEFAULT_MAX_DRIVE,
-                 deadman_s=DEFAULT_DEADMAN_S, max_power_watts=None):
+                 deadman_s=DEFAULT_DEADMAN_S, max_power_watts=None,
+                 feed_ahead_s=DEFAULT_FEED_AHEAD_S):
         """
         radio: an opened Radio (provides .ctrl, .radio_ip, .profile, .wire_rate).
         loopback_dest: (ip, port) to send TX IQ to instead of the radio's TX
@@ -76,6 +82,9 @@ class TXSession:
         self.power_cal = power_cal or TXPowerCal()
         self.max_drive = int(max_drive)
         self.deadman_s = float(deadman_s)
+        # IQ pre-buffer ahead of the pacer (s) — the dominant voice->RF latency.
+        # Live-settable via set_feed_ahead(); read each feed iteration.
+        self.feed_ahead_s = float(feed_ahead_s)
         self._deadman_timer: Optional[threading.Timer] = None
         # Amp-protection output-power ceiling (watts). Stored read-only: kept in
         # a name-mangled attribute and exposed only via the max_power_watts
@@ -239,7 +248,6 @@ class TXSession:
 
     def _feed_loop(self, source_iter, iq_input=False):
         import time
-        target_ahead = int(self.wire_rate * 0.8)
         for block in source_iter:
             if not self._running:
                 break
@@ -250,11 +258,21 @@ class TXSession:
             # legitimate long over (WSPR, ragchew, big file) alive indefinitely
             # while a genuinely stalled source still trips the timeout.
             self.kick_deadman()
+            # How much modulated IQ to keep buffered ahead of the pacer. This is
+            # the DOMINANT steady-state TX latency (voice -> RF): the pacer
+            # drains at real time, so ~feed_ahead_s of audio always sits here.
+            # Bigger = safer against underruns (clicks/gaps) but more delay;
+            # smaller = lower latency but risks starving the 5.12 ms pacer if the
+            # feed thread is descheduled. Read each iteration so set_feed_ahead()
+            # applies live. Floor of 2 packets. Live voice wants ~0.1-0.15 s;
+            # digital modes (FT8/JS8, pre-generated + timed) don't care.
+            target_ahead = max(int(self.wire_rate * self.feed_ahead_s),
+                               pk.IQ_SAMPLES_PER_PKT * 2)
             while self._running:
                 with self._buf_lock:
                     if len(self._iq_buf) < target_ahead:
                         break
-                time.sleep(0.02)
+                time.sleep(0.005)
 
     # -- session -----------------------------------------------------------
     def enter_tx(self, source_iter, watts: Optional[float] = None,
@@ -374,6 +392,12 @@ class TXSession:
         if self.keyed:
             self._log(f'!!! DEAD-MAN TIMEOUT ({self.deadman_s}s) — force unkey !!!')
             self.exit_tx()
+
+    def set_feed_ahead(self, seconds):
+        """Set the IQ pre-buffer depth (s) live — the dominant voice->RF latency.
+        Clamped to a sane range; applies on the next feed iteration."""
+        self.feed_ahead_s = max(0.02, min(float(seconds), 2.0))
+        return self.feed_ahead_s
 
     def kick_deadman(self):
         """Restart the dead-man countdown — call periodically during a long
