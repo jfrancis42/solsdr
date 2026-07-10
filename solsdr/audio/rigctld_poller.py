@@ -14,11 +14,62 @@ a real rigctld rather than serving the protocol itself). The distributed Hamlib
 has no SunSDR2 backend, so the dummy backend is used purely as a faithful state
 store that JS8Call drives and we read back.
 """
+import os
 import shutil
+import signal
 import socket
 import subprocess
 import threading
 import time
+
+
+def _argv_targets_port(argv, port):
+    """True if this argv is a `rigctld` invocation listening on `port`.
+
+    Matches `-t <port>` / `-t<port>`; a rigctld with no explicit `-t` uses the
+    Hamlib default of 4532. Case-sensitive so `-T` (host) is never mistaken for
+    `-t` (port). Pure/argv-only so it can be unit-tested without a live process.
+    """
+    if not argv or os.path.basename(argv[0]) != 'rigctld':
+        return False
+    port_tok = str(port)
+    for i, a in enumerate(argv):
+        if a == '-t' and i + 1 < len(argv) and argv[i + 1] == port_tok:
+            return True
+        if a == '-t' + port_tok:
+            return True
+    has_explicit_port = any(a == '-t' or (a.startswith('-t') and len(a) > 2)
+                            for a in argv)
+    return port_tok == '4532' and not has_explicit_port
+
+
+def _stale_rigctld_pids(port):
+    """PIDs of rigctld processes bound to `port` (Linux /proc; [] elsewhere).
+
+    Best-effort: skips our own PID and anything we can't read. On a host with
+    no /proc it returns nothing rather than raising, so the guard is a no-op.
+    """
+    pids = []
+    try:
+        entries = os.listdir('/proc')
+    except OSError:
+        return pids
+    me = os.getpid()
+    for name in entries:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == me:
+            continue
+        try:
+            with open(f'/proc/{pid}/cmdline', 'rb') as fh:
+                argv = [a.decode(errors='replace')
+                        for a in fh.read().split(b'\x00') if a]
+        except OSError:
+            continue
+        if _argv_targets_port(argv, port):
+            pids.append(pid)
+    return pids
 
 
 class RigctldPoller:
@@ -54,6 +105,14 @@ class RigctldPoller:
         if shutil.which('rigctld') is None:
             raise RuntimeError('rigctld not found — install Hamlib (hamlib / '
                                'libhamlib-utils)')
+        # Reap any orphaned rigctld already bound to our CAT port. Because
+        # rigctld inherits SO_REUSEADDR, a leftover from a crashed/kill -9'd
+        # solsdr does NOT make our launch fail — it silently joins the listener
+        # pool, and the kernel then load-balances connections across the
+        # instances. Each is an independent state store, so JS8Call's `F` lands
+        # on one and our poller reads another: CAT changes vanish with no error.
+        # Kill the strays first so we own the port cleanly.
+        self._reap_orphans()
         # Launch real rigctld with the dummy backend as the CAT endpoint.
         self._rigctld = subprocess.Popen(
             ['rigctld', '-m', self.model, '-T', self.host, '-t', str(self.port)],
@@ -84,6 +143,31 @@ class RigctldPoller:
         self._thread.start()
         self._log(f'real rigctld -m {self.model} on {self.host}:{self.port}; '
                   f'polling freq/mode/PTT')
+
+    def _reap_orphans(self):
+        """Kill any pre-existing rigctld bound to our port (SIGTERM, then
+        SIGKILL for stragglers). No-op if none or if /proc is unavailable."""
+        pids = _stale_rigctld_pids(self.port)
+        if not pids:
+            return
+        self._log(f'reaping {len(pids)} orphaned rigctld on :{self.port}: '
+                  f'{pids}')
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        # Give them a moment to exit, then SIGKILL whatever ignored SIGTERM.
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if not _stale_rigctld_pids(self.port):
+                return
+            time.sleep(0.1)
+        for pid in _stale_rigctld_pids(self.port):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
 
     def stop(self):
         self._running = False
