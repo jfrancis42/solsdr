@@ -177,9 +177,12 @@ on‑air by JS8Call through the audio bridge. See **Transmit** below.
 
 ## Install
 
+**On PyPI:** [`pip install solsdr`](https://pypi.org/project/solsdr/) — the
+package is published, so you don't need a clone to use it.
+
 ```bash
 # Option A — install the package (gives you the `solsdr` command):
-pip install .                          # from a clone; or:  pip install solsdr
+pip install solsdr                     # from PyPI; or, from a clone:  pip install .
 
 # Option B — run from a source checkout without installing:
 pip install -r requirements.txt        # numpy, scipy, sounddevice
@@ -191,6 +194,23 @@ checkout, **`python3 -m solsdr`**. `rigctld` (from `hamlib` / `libhamlib-utils`)
 and PulseAudio/PipeWire are required for the TX/digital-mode bridge (it warns and
 runs RX-only if they're absent). For an always-on headless setup, see
 [`systemd/README.md`](systemd/README.md).
+
+### Platform support
+
+- **Linux — supported.** solsdr is written and tested on Linux and is known to
+  work there (audio via PulseAudio/PipeWire). This is the reference platform.
+- **macOS — expected to work, untested.** The protocol/DSP/networking are
+  portable; the open question is audio device handling (solsdr uses
+  `sounddevice`/PortAudio for RX audio and PulseAudio tools — `pactl`/`pacat`/
+  `parec` — for the digital-mode/TX bridge). macOS is a definite future target;
+  reports and PRs welcome.
+- **Windows — will almost certainly not work as-is.** Audio device handling plus
+  other assumptions (the PulseAudio CLI tools, `SCHED_FIFO`/`timerfd` in the TX
+  pacer, POSIX signals) need real porting work. **Windows PRs are welcome and I'm
+  happy to merge them**, but I don't have a Windows system to develop or test on,
+  so I won't be doing that port myself.
+
+**Contributions:** PRs are welcome — especially macOS audio and a Windows port.
 
 ## Quick start
 
