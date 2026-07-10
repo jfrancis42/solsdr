@@ -15,6 +15,13 @@ IQ. It's built for **experimentation**:
 - **Scripting / DSP** — a clean Python API (`Radio`, `Demodulator`, `Modulator`,
   `TXSession`) for building your own receivers, transmitters, and measurements.
 
+> **The core use case is digital modes** (JS8Call, WSJT‑X, fldigi) and
+> software‑driven IQ/DSP — that's what solsdr is built and verified for. Voice
+> operation exists but is secondary: you can transmit SSB/phone by feeding a
+> **PC** mic into the TX audio device (see "Voice / SSB from a PC mic"), while
+> using the radio's **front‑panel Mic1/Mic2 jacks** is **not** supported yet and
+> is future work (see the feature table and TODO for why and what it would take).
+
 **A core design goal: solsdr has no GUI, by intent.** The entire SDR — every bit
 of its functionality — is a "front‑panel‑less" command‑line program, meant to be
 *remote‑controlled by other software* rather than operated by hand. There is no
@@ -99,6 +106,8 @@ on‑air by JS8Call through the audio bridge. See **Transmit** below.
 | Supply telemetry: voltage / current / temperature / forward‑power | ✅ `0x1F` fully decoded; shown in status (V/A, °F). Includes a forward‑power field (`fwd_power_raw`). No SWR is reported by the radio. Temperature is read‑only — the radio runs its own fan in firmware (no host setpoint) |
 | Front-end: HF.LPF, VHF.LNA toggles | ✅ opcodes verified (relay‑confirmed); `lpf`/`lna` shell cmds |
 | Mic source (Mic1/Mic2/PC) | ✅ verified (`0x21`); `mic` shell cmd. Mic gain is client‑side (no radio cmd) |
+| Front‑panel mic (Mic1/Mic2 jack) → on‑air voice | ⛔ **not supported.** solsdr transmits **host‑generated IQ**, not the radio's internal analog modulator. The front‑panel mic feeds the radio's own modulator, which solsdr bypasses — a mic in Mic1/Mic2 is not in the TX path. To talk, feed a **PC** mic into the `solsdr-tx` sink (see "Voice / SSB from a PC mic"). Would require new firmware‑modulation support that isn't reverse‑engineered (see TODO). |
+| Radio's external/hardware PTT input line | ⛔ **not supported / TODO: test.** solsdr keys via CAT only (`0x06` MOX over UDP). Nothing in the code reads the radio's external‑PTT input, and it's unknown whether the radio even reports that line's state to the host over the wire — untested. There is **no VOX** either. |
 | USB / LSB / AM / FM / CW demodulation + S‑meter | ✅ verified |
 | CW receive: BFO demod + Morse decoder | ✅ verified (synthetic full‑chain) |
 | Automatic reconnection on network loss | ✅ verified (simulated interruption) |
@@ -133,6 +142,16 @@ on‑air by JS8Call through the audio bridge. See **Transmit** below.
   responsibly and legally.
 - **VHF** — largely untested; deliberately never keyed during TX calibration.
 - **SunSDR2 DX** — profile is coded from ArtemisSDR but unverified on hardware.
+- **Front‑panel mic + hardware/external PTT** — NOT supported and only partly
+  investigated. solsdr's TX is host‑generated IQ streamed over UDP; the analog
+  Mic1/Mic2 jacks feed the radio's *internal* modulator, which this project
+  bypasses, and PTT is CAT‑only (`0x06` MOX). Making the front‑panel mic key and
+  modulate on its own would require the radio to run its internal modulator on a
+  host command and to report its external‑PTT input state to the host — neither
+  path is reverse‑engineered. **TODO: capture ExpertSDR3** keying from the
+  front‑panel mic + external PTT to learn whether the radio (a) modulates
+  internally when told to and (b) sends a host‑visible PTT‑input status
+  bit/packet. Until then, transmit with a **PC mic into `solsdr-tx`** (below).
 - **CW receive decode → shell** — the RX Morse decoder exists but decoded text
   isn't yet surfaced in the transceiver shell (planned). CW *transmit* is done
   (`cw <text>`).
@@ -541,6 +560,42 @@ Run `python3 -m solsdr.audio --help` for all flags. Key ones: `--max-power-watts
 speaker so you can hear glitches). If the app can't open the device, quit it,
 start the bridge first, then relaunch the app so it binds to the current
 PulseAudio nodes.
+
+### Voice / SSB from a PC mic (not the radio's front‑panel mic)
+
+The radio's front‑panel Mic1/Mic2 jacks do **not** work for on‑air voice through
+solsdr — solsdr transmits IQ it modulates on the host, and never uses the radio's
+internal modulator (see the feature table). To operate phone, feed a mic
+attached to **the computer** into the `solsdr-tx` sink; solsdr modulates it
+(SSB/AM/FM per `--tx-mode` / `tx mode`) and streams the IQ to the radio, exactly
+like it does for JS8Call's audio.
+
+There is **no VOX**, so you supply PTT yourself — over **CAT**. With the bridge
+running, loop your mic's input source into the TX sink, then key/unkey via any
+Hamlib CAT client (the same `127.0.0.1:4532` rigctld the bridge launches):
+
+```bash
+# Send your PC mic (find the real source with: pactl list sources short)
+# into the TX sink the modulator reads:
+pactl load-module module-loopback \
+    source=<your_mic_source> sink=solsdr-tx latency_msec=30
+
+# Key / unkey with rigctl (PTT edge -> the bridge arms/keys a TXSession):
+rigctl -m 2 -r 127.0.0.1:4532 \
+    - <<'CMD'
+T 1
+CMD
+# ...talk... then:  T 0   to unkey.
+```
+
+Any PTT source works as long as it drives that rigctld's PTT: a `T 1`/`T 0` from
+`rigctl`, a foot‑switch wired to a CAT app, or an app configured with **PTT =
+CAT** pointed at `127.0.0.1:4532`. When the bridge sees the CAT PTT‑on edge it
+arms a `TXSession`, and on PTT‑off it unkeys and RX resumes — the same interlocks
+(arming, dead‑man, drive ceiling, calibration‑gated amp limit) apply as for
+digital modes. Unload the loopback with
+`pactl unload-module <id>` when done. Use `--monitor <sink>` to hear the exact
+audio being modulated. **Validate into a dummy load first.**
 
 ---
 
