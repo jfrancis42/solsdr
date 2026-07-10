@@ -53,7 +53,7 @@ class Radio:
     # reconnect (re-wake + re-power-on + rebuild sockets + re-tune).
     RECONNECT_AFTER = 4       # ~8 s
 
-    def __init__(self, radio_ip: Optional[str] = None, local_ip: str = '10.1.2.185',
+    def __init__(self, radio_ip: Optional[str] = None, local_ip: str = '',
                  variant: str = 'PRO', verbose: bool = True,
                  auto_reconnect: bool = True, reconnect_max_backoff: float = 30.0,
                  on_state_change: Optional[Callable[[str], None]] = None,
@@ -99,6 +99,13 @@ class Radio:
         self._tx_seq = 0
         self._callback: Optional[Callable] = None
         self._callback_wants_index = False
+        # Optional front-panel-TX callbacks (set by the bridge). The radio just
+        # dispatches the packets it already receives on 50002; the bridge owns
+        # the keying/modulation policy.
+        #   on_ptt_edge(pressed: bool)      — external/hardware PTT input edge
+        #   on_tx_audio(mono_f32: ndarray)  — downstream mic audio while keyed
+        self.on_ptt_edge: Optional[Callable[[bool], None]] = None
+        self.on_tx_audio: Optional[Callable[[np.ndarray], None]] = None
         # Serializes access to the control socket (keepalive thread, RX-loop
         # recovery/reconnect, and set_frequency/set_mode all share it).
         self._ctrl_lock = threading.Lock()
@@ -308,6 +315,14 @@ class Radio:
     def streaming(self):
         return 1 if (self._running and time.time() - self.last_rx_time < 1.0) else 0
 
+    def _safe_ptt_edge(self, cb, pressed):
+        """Run an external-PTT-edge callback off the RX loop (keying blocks on
+        control-socket I/O; the RX loop must keep echoing keepalives)."""
+        try:
+            cb(pressed)
+        except Exception as e:  # noqa: BLE001
+            self._log(f'ptt-edge callback error: {e}')
+
     # -- streaming ---------------------------------------------------------
     def _make_tx_silence(self, seq: int) -> bytes:
         """1210-byte silence packet the client must echo per RX packet."""
@@ -454,8 +469,32 @@ class Radio:
 
             decoded = pk.decode_iq_packet_rx(data, magic=self.profile.magic)
             if decoded is None:
-                # Not an IQ frame — could be the periodic 0x1F telemetry
-                # (supply V/A + temperature) that also arrives on this port.
+                # Not an RX IQ frame. Several other packet types share port
+                # 50002; dispatch each to its handler.
+                # 1) External-PTT edge (0x1F byte2=0x01): a hardware footswitch /
+                #    mic PTT changed state. Fire the bridge's callback so it can
+                #    key/unkey. Keying blocks (control-socket I/O), so run the
+                #    callback on a short-lived thread — never stall the RX loop.
+                ptt = pk.parse_ptt_edge(data, magic=self.profile.magic)
+                if ptt is not None:
+                    cb = self.on_ptt_edge
+                    if cb is not None:
+                        threading.Thread(target=self._safe_ptt_edge,
+                                         args=(cb, ptt), daemon=True).start()
+                    continue
+                # 2) Downstream TX audio (0xFD): while keyed with a front-panel
+                #    mic, the radio streams the mic audio down for the host to
+                #    modulate. Deliver mono float32 to the bridge inline (cheap;
+                #    it just enqueues).
+                if self.on_tx_audio is not None:
+                    mic = pk.decode_tx_audio_packet(data, magic=self.profile.magic)
+                    if mic is not None:
+                        try:
+                            self.on_tx_audio(mic)
+                        except Exception as e:  # noqa: BLE001
+                            self._log(f'tx-audio callback error: {e}')
+                        continue
+                # 3) Periodic supply telemetry (0x1F byte2=0x00).
                 tlm = pk.parse_telemetry(data, magic=self.profile.magic)
                 if tlm is not None:
                     self.telemetry = tlm

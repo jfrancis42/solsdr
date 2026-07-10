@@ -17,10 +17,10 @@ Examples:
     python3 -m solsdr.server --mock
 
     # Real hardware, IP known
-    python3 -m solsdr.server --radio 10.1.2.3
+    python3 -m solsdr.server --radio 192.0.2.10
 
     # Real hardware, discover via broadcast wake
-    python3 -m solsdr.server --wake --local-ip 10.1.2.185
+    python3 -m solsdr.server --wake --local-ip 192.0.2.20
 """
 import argparse
 import signal
@@ -141,11 +141,11 @@ def main():
     ap = argparse.ArgumentParser(description='solsdr-server unified daemon')
     ap.add_argument('--mock', action='store_true',
                     help='run against the built-in mock radio (no hardware)')
-    ap.add_argument('--radio', metavar='IP', help='real radio IP (e.g. 10.1.2.3)')
+    ap.add_argument('--radio', metavar='IP', help='real radio IP (e.g. 192.0.2.10)')
     ap.add_argument('--wake', action='store_true',
                     help='broadcast-discover the radio before connecting')
-    ap.add_argument('--local-ip', default='10.1.2.185',
-                    help='local interface IP for wake broadcast')
+    ap.add_argument('--local-ip', default='',
+                    help='local interface IP for wake broadcast (default: all)')
     ap.add_argument('--control-port', type=int, default=5556)
     ap.add_argument('--hamlib-port', type=int, default=4532)
     ap.add_argument('--tone', type=float, default=1000.0,

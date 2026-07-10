@@ -66,8 +66,11 @@ def parse_reply(buf):
     return ip, port
 
 
-def wake(local_ip='10.1.2.185', bcast='10.1.2.255', mac=DEFAULT_MAC,
+def wake(local_ip='', bcast='255.255.255.255', mac=DEFAULT_MAC,
          timeout=120, verbose=True):
+    # local_ip='' binds all interfaces (works without knowing the local address);
+    # bcast defaults to the global broadcast. Pass a specific local IP / directed
+    # subnet broadcast if you have multiple interfaces and need to pick one.
     '''Fire WoL + discovery until the radio answers. Returns (ip, port) or None.'''
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)

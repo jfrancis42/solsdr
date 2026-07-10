@@ -35,7 +35,7 @@ PKT_INTERVAL = SAMPLES_PER_PKT / RADIO_RATE  # ~640 us
 
 class MockRadio:
     def __init__(self, bind_ip='0.0.0.0', client_ip='127.0.0.1',
-                 radio_ip='10.1.2.3', tone_hz=1000.0, magic=pk.MAGIC_PRO,
+                 radio_ip='192.0.2.3', tone_hz=1000.0, magic=pk.MAGIC_PRO,
                  verbose=True):
         self.bind_ip = bind_ip
         self.client_ip = client_ip
@@ -200,7 +200,7 @@ def main():
     ap = argparse.ArgumentParser(description='Mock SunSDR2 PRO radio')
     ap.add_argument('--bind', default='0.0.0.0', help='bind IP for control socket')
     ap.add_argument('--client', default='127.0.0.1', help='client IP to stream IQ to')
-    ap.add_argument('--radio-ip', default='10.1.2.3', help='IP to report in discovery reply')
+    ap.add_argument('--radio-ip', default='192.0.2.10', help='IP to report in discovery reply')
     ap.add_argument('--tone', type=float, default=1000.0, help='RX tone offset Hz')
     args = ap.parse_args()
 

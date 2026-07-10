@@ -29,6 +29,16 @@ from solsdr.dsp.demod import Demodulator
 AUDIO_RATE = 48000
 
 
+def _device_arg(v):
+    """argparse type for --device/--rx2-device: an int index if it parses as one,
+    else a device-NAME substring (passed to sounddevice, which matches by name).
+    Names are stable across USB hotplug; numeric indices are not."""
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return v
+
+
 class _RadioControlAdapter:
     """Adapts AudioReceiver to the control-object interface the API servers
     expect (set_frequency/set_mode/current_freq/current_mode/streaming)."""
@@ -162,6 +172,12 @@ class _RadioControlAdapter:
         # RX1's smoothed signal level in dBFS (already computed each block).
         return self._rx.channels[0].demod.s_meter
 
+    @property
+    def telemetry(self):
+        # Radio supply telemetry (V/A/temp + fwd_power_raw), or None. Lets a
+        # control-API client confirm TX (fwd_power_raw rises on key) remotely.
+        return self._rx.radio.telemetry
+
 
 class _RXChannel:
     """Per-receiver demod + filter + audio-out + IQ-sink state. AudioReceiver
@@ -206,8 +222,8 @@ class _RXChannel:
 
 
 class AudioReceiver:
-    def __init__(self, freq_khz, mode='USB', device=5, local_ip='10.1.2.185',
-                 radio_ip='10.1.2.3', variant='PRO', sample_rate=None,
+    def __init__(self, freq_khz, mode='USB', device=5, local_ip='',
+                 radio_ip=None, variant='PRO', sample_rate=None,
                  ext_ref=None, rx2_khz=None, rx2_mode=None, rx2_device=None):
         self.freq_hz = int(freq_khz * 1000)
         self.device = device
@@ -384,7 +400,19 @@ dummy load, and obeys the amp-limit / calibration interlocks.
     tx maxpower <W>    amp-protection ceiling + default TX power (default 5 W;
                        0 = no ceiling). Also the power used when none is set.
     tx mode <mode>     TX modulation mode (USB/LSB/AM/FM)
-    tx micgain <x>     mic/TX-audio gain multiplier (1.0 = unity; e.g. 1.5)
+    tx source <src>    TX audio source: pc (the -tx sink / a PC mic routed in) |
+                       mic1 | mic2 (the radio's FRONT-PANEL mic, streamed back
+                       and modulated here). mic1/mic2 also set the radio mic src.
+    tx hwptt on|off    key TX from the radio's external/footswitch PTT input
+    tx cal [s]         ⚠ CALIBRATE the current source's gain: talk normally for
+                       s sec (default 4); mic1/mic2 KEY the radio (dummy load!),
+                       pc measures the sink with no RF. Saved per source.
+    tx shape [src] <p> voice shaping preset per source: flat | comms | dx
+                       (flat=hand mic, comms=studio/PC default, dx=punchy)
+    tx gain [src] <x>  manually set a source's input gain (marks it calibrated)
+    tx micgain <x>     extra TX-audio gain, ALL sources (1.0 = unity; e.g. 1.5)
+    tx latency <ms>    voice->RF pre-buffer in ms (lower = less delay hearing
+                       yourself; too low risks clicks/gaps. default 120)
     tx wpm <c> [<w>]   CW send speed: element <c> wpm, optional Farnsworth
                        spacing <w> wpm (w<c). e.g. "tx wpm 25 15" = 15wpm@25
     tx cwtone <Hz>     CW send sidetone/pitch (default 600)
@@ -394,6 +422,14 @@ dummy load, and obeys the amp-limit / calibration interlocks.
                        bound to the old names. (Set at launch with --prefix.)
     tune [s] [W]       ⚠ KEY a CW tuning carrier: s sec (default 3),
                        W watts (default current power). e.g. "tune", "tune 5 3"
+
+  VOICE / PTT   (⚠ transmit — antenna or dummy load required)
+    key / unkey        ⚠ software PTT: key (then unkey) TX with the current
+                       tx source. `ptt`/`unptt` are aliases.
+    voice              ⚠ hands-on-keyboard PTT: HOLD SPACE = push-to-talk;
+                       ENTER = toggle latched TX on/off; q/Esc exits.
+    (footswitch)       set `tx hwptt on` to key from the radio's external PTT
+                       input; set `tx source mic1|mic2` for the front-panel mic.
 
   FRONT END / RADIO
     preamp <state>     -20 | -10 | 0 | +10 (dB) | off | preamp
@@ -445,7 +481,14 @@ def _tx_command(rx, arg):
         print(f'    maxpower = {br.max_power_watts if br.max_power_watts is not None else "none"} W'
               f'   (amp-protection ceiling; next over only)')
         print(f'    mode     = {br.tx_mode}   (next over)')
-        print(f'    micgain  = {br.mic_gain:g}   (TX audio gain; applies live)')
+        print(f'    source   = {br.tx_source}   (pc | mic1 | mic2 front-panel mic)')
+        print(f'    hwptt    = {"on" if br.hw_ptt_enabled else "off"}   '
+              f'(key from radio external/footswitch PTT input)')
+        for s in ('mic1', 'mic2', 'pc'):
+            mark = ' <- active' if s == br.tx_source else ''
+            print(f'      profile {s}: {br.source_profiles.get(s)}{mark}')
+        print(f'    micgain  = {br.mic_gain:g}   (extra TX audio gain, all sources; applies live)')
+        print(f'    latency  = {br.tx_feed_ahead_s*1000:.0f} ms   (voice->RF pre-buffer; lower=less delay)')
         fw = (f' Farnsworth (elements {br.cw_char_wpm:g}wpm)'
               if br.cw_word_wpm and br.cw_word_wpm < br.cw_char_wpm else '')
         eff = br.cw_word_wpm or br.cw_char_wpm
@@ -484,6 +527,56 @@ def _tx_command(rx, arg):
                 print(f'  mode = {br.tx_mode}'); return
             br.tx_mode = val.upper()
             print(f'  tx mode -> {br.tx_mode} (next over)')
+        elif word == 'source':
+            if val is None:
+                print(f'  source = {br.tx_source}  (pc | mic1 | mic2)'); return
+            ok, msg = br.set_tx_source(val)
+            print(f'  {msg}')
+        elif word == 'hwptt':
+            if val is None:
+                print(f'  hwptt = {"on" if br.hw_ptt_enabled else "off"}  '
+                      f'(key from the radio external/footswitch PTT input)'); return
+            on = val.lower() in ('on', '1', 'true', 'yes')
+            br.set_hw_ptt(on)
+            print(f'  tx hwptt -> {"on" if on else "off"} '
+                  f'({"footswitch/mic PTT now keys TX" if on else "hardware PTT ignored"})')
+        elif word in ('latency', 'delay'):
+            if val is None:
+                print(f'  latency = {br.tx_feed_ahead_s*1000:.0f} ms '
+                      f'(voice->RF IQ pre-buffer; lower=less delay, more '
+                      f'click risk)'); return
+            ms = float(val)
+            got = br.set_feed_ahead(ms / 1000.0)
+            print(f'  tx latency -> {got*1000:.0f} ms'
+                  f'{" (applied to live TX)" if br.is_keyed() else ""}')
+        elif word == 'cal':
+            _calibrate_command(rx, val or '');
+        elif word == 'shape':
+            # tx shape [<src>] <preset>  (src defaults to current source)
+            nums = (val or '').split()
+            if not nums:
+                for s in ('mic1', 'mic2', 'pc'):
+                    print(f'  {s}: {br.source_profiles.get(s)}')
+                return
+            if len(nums) == 1:
+                src, preset = br.tx_source, nums[0]
+            else:
+                src, preset = nums[0], nums[1]
+            ok, msg = br.set_source_shape(src, preset)
+            print(f'  {msg}')
+        elif word == 'gain':
+            # tx gain [<src>] <value>  (src defaults to current source)
+            nums = (val or '').split()
+            if not nums:
+                for s in ('mic1', 'mic2', 'pc'):
+                    print(f'  {s}: {br.source_profiles.get(s)}')
+                return
+            if len(nums) == 1:
+                src, gv = br.tx_source, nums[0]
+            else:
+                src, gv = nums[0], nums[1]
+            ok, msg = br.set_source_gain(src, float(gv))
+            print(f'  {msg}')
         elif word == 'micgain':
             if val is None:
                 print(f'  micgain = {br.mic_gain:g}'); return
@@ -564,6 +657,171 @@ def _tune_command(rx, arg):
     print(f'  {msg}')
 
 
+def _key_command(rx, on):
+    """`key` / `unkey` — software PTT. Keys (or unkeys) the transmitter with the
+    current TX source (pc / mic1 / mic2). The counterpart to a footswitch for
+    hands-on-keyboard voice / whenever you want an explicit press."""
+    br = getattr(rx, 'bridge', None)
+    if br is None:
+        print('  key unavailable (no TX bridge).'); return
+    if on:
+        if br.tx_source == 'pc':
+            print('  ⚠️  KEY (software PTT) — sending PC/tx-sink audio. '
+                  '`unkey` to stop. Antenna/dummy load!')
+        else:
+            print(f'  ⚠️  KEY (software PTT) — {br.tx_source} front-panel mic. '
+                  f'`unkey` to stop. Antenna/dummy load!')
+        br.set_ptt(True)
+        print(f'  keyed ({br.tx_source}).' if br.is_keyed()
+              else '  key refused (interlock — check power/calibration).')
+    else:
+        br.set_ptt(False)
+        print('  unkeyed.')
+
+
+def _voice_command(rx):
+    """`voice` — hands-on-keyboard PTT, two ways at once:
+
+      SPACE (hold)  push-to-talk: transmit WHILE held, unkey on release.
+      ENTER (tap)   toggle latched TX on/off (hands-free; tap to start, tap to
+                    stop) — for a ragchew where you don't want to hold a key.
+      q / Esc       exit back to the shell.
+
+    Uses the current TX source. Both use cases are covered: momentary (space) and
+    latched (enter). A latched transmission stays up regardless of space, and is
+    ended by another ENTER (or q/Esc).
+
+    Implementation notes:
+      * Hold-to-talk relies on key-autorepeat: while space is held the terminal
+        delivers repeated spaces, so we key on the first and unkey only after a
+        RELEASE_GAP idle with no space (that gap must exceed the ~30 ms repeat
+        interval). Works over SSH/tmux where repeat is on.
+      * ENTER is DEBOUNCED (TOGGLE_DEBOUNCE) so a held/repeated Enter toggles
+        once, not in a storm.
+      * `latched` is tracked separately from `keyed`: while latched, the space
+        release-gap is ignored so a hands-free over doesn't drop.
+    If key-repeat is off (bare console), hold-to-talk degrades to
+    key-until-timeout — use ENTER latch or `key`/`unkey` there."""
+    import select
+    import sys as _sys
+    import termios
+    import time as _t
+    import tty
+    br = getattr(rx, 'bridge', None)
+    if br is None:
+        print('  voice unavailable (no TX bridge).'); return
+    if not _sys.stdin.isatty():
+        print('  voice needs an interactive terminal.'); return
+    RELEASE_GAP = 0.25        # unkey this long after last space (> repeat interval)
+    TOGGLE_DEBOUNCE = 0.4     # ignore Enter repeats within this window
+    src = br.tx_source
+    print(f'  VOICE (source={src}).  HOLD SPACE = push-to-talk;  ENTER = toggle '
+          f'latched TX on/off;  q/Esc = exit.  ⚠️ antenna/dummy load!')
+    fd = _sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    last_space = 0.0
+    last_toggle = 0.0
+    keyed = False
+    latched = False
+
+    def _show(tag):
+        _sys.stdout.write(f'\r  {tag}                    \r'); _sys.stdout.flush()
+
+    def _rx_prompt():
+        _show('RX  (hold SPACE / tap ENTER to latch)')
+
+    try:
+        tty.setcbreak(fd)
+        _rx_prompt()
+        while True:
+            r, _, _ = select.select([_sys.stdin], [], [], 0.05)
+            now = _t.monotonic()
+            if r:
+                ch = _sys.stdin.read(1)
+                if ch in ('q', '\x1b'):           # q or Esc
+                    break
+                if ch in ('\r', '\n'):            # ENTER — toggle latch (debounced)
+                    if now - last_toggle >= TOGGLE_DEBOUNCE:
+                        last_toggle = now
+                        if latched or keyed:
+                            br.set_ptt(False)
+                            keyed = latched = False
+                            _rx_prompt()
+                        else:
+                            br.set_ptt(True)
+                            keyed = latched = br.is_keyed()
+                            _show('TX LATCHED (tap ENTER to stop)' if keyed
+                                  else 'key refused')
+                elif ch == ' ':                   # SPACE — momentary PTT
+                    last_space = now
+                    if not keyed:
+                        br.set_ptt(True)
+                        keyed = br.is_keyed()
+                        _show('TX (holding)' if keyed else 'key refused')
+            # Momentary release: only when NOT latched.
+            if keyed and not latched and (now - last_space) > RELEASE_GAP:
+                br.set_ptt(False)
+                keyed = False
+                _rx_prompt()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        if br.is_keyed():
+            br.set_ptt(False)
+        print('\n  voice mode exited (unkeyed).')
+
+
+def _calibrate_command(rx, arg):
+    """`tx cal [seconds]` — calibrate the CURRENT tx source's mic gain by
+    measuring your normal speaking level, then computing the gain that hits the
+    headroom target. Saves it to the source's profile (auto-level off for it).
+
+    PC source: measured from the -tx sink, NO transmit. mic1/mic2: the radio only
+    streams the mic while keyed, so this KEYS the transmitter for the measurement
+    window — dummy load / antenna required."""
+    import time as _t
+    br = getattr(rx, 'bridge', None)
+    if br is None:
+        print('  calibrate unavailable (no TX bridge).'); return
+    parts = arg.split()
+    seconds = 4.0
+    try:
+        if parts:
+            seconds = float(parts[0])
+    except ValueError:
+        print('  usage: tx cal [seconds]'); return
+    seconds = max(2.0, min(seconds, 15.0))
+    src = br.tx_source
+
+    if src == 'pc':
+        print(f'  CAL {src}: speak NORMALLY into the PC mic for {seconds:g}s '
+              f'(no transmit)...')
+        br.devices.flush_tx()
+        br.start_source_meter()
+        end = _t.monotonic() + seconds
+        while _t.monotonic() < end:
+            br.read_pc_peak_block()
+            _t.sleep(0.02)
+        ok, msg = br.finish_source_calibration()
+        print(f'  {msg}' if ok else f'  calibration failed: {msg}')
+        return
+
+    # mic1/mic2: must key to receive the downstream mic audio.
+    print(f'  ⚠️  CAL {src}: this KEYS the transmitter for {seconds:g}s to '
+          f'measure the front-panel mic. DUMMY LOAD / antenna required!')
+    print(f'  Speak NORMALLY into the {src} mic when keying starts...')
+    br.start_source_meter()
+    br.set_ptt(True)
+    if not br.is_keyed():
+        br._meter_on = False
+        print('  key refused (interlock — check power/calibration/band). '
+              'Aborted, no measurement.')
+        return
+    _t.sleep(seconds)
+    br.set_ptt(False)
+    ok, msg = br.finish_source_calibration(src)
+    print(f'  {msg}' if ok else f'  calibration failed: {msg}')
+
+
 def _list_devices():
     """Print available audio devices (sounddevice) + PulseAudio sinks if present."""
     try:
@@ -610,10 +868,15 @@ def _live_params(rx):
         br = rx.bridge
         p.update({
             'tx_mode': br.tx_mode,
+            'tx_source': br.tx_source,
+            'tx_hwptt': br.hw_ptt_enabled,
             'tx_mic_gain': br.mic_gain,
+            'tx_latency_ms': round(br.tx_feed_ahead_s * 1000, 1),
             'tx_watts': br.tx_watts,
             'max_power_watts': br.max_power_watts,
         })
+        # Per-source audio profiles (gain/shape/calibrated), one set of flat keys.
+        p.update(br.source_profiles_config())
     return p
 
 
@@ -650,8 +913,18 @@ def _read_config(rx):
             br = rx.bridge
             if 'tx_mode' in c:
                 br.tx_mode = str(c['tx_mode']).upper()
+            # Per-source audio profiles first, so a following tx_source switch
+            # reports the right profile.
+            if any(k.startswith('tx_src_') for k in c):
+                br.load_source_profiles(c)
+            if 'tx_source' in c:
+                br.set_tx_source(str(c['tx_source']))
+            if 'tx_hwptt' in c:
+                br.set_hw_ptt(c['tx_hwptt'] in (True, 'true', 'on', '1', 1))
             if 'tx_mic_gain' in c:
                 br.set_mic_gain(float(c['tx_mic_gain']))
+            if 'tx_latency_ms' in c:
+                br.set_feed_ahead(float(c['tx_latency_ms']) / 1000.0)
             if 'tx_watts' in c:
                 br.set_tx_watts(None if c['tx_watts'] in (None, 'none', '') else float(c['tx_watts']))
             if 'max_power_watts' in c:
@@ -703,14 +976,15 @@ def _setup_readline():
 # sub-tokens to complete after them.
 _TOP_COMMANDS = [
     'help', 'quit', 'exit', 'devices', 's', 'status',
-    'tx', 'tune', 'read-config', 'write-config',
+    'tx', 'tune', 'key', 'unkey', 'voice', 'read-config', 'write-config',
     'm', 'cw', 'ref', 'lpf', 'lna', 'mic', 'preamp', 'rit',
     'agc', 'gain', 'vol', 'nr', 'nb', 'notch', 'apf', 'sql', 'filter',
     'sharpness', 'skirt',
 ]
 _SUB_COMPLETIONS = {
-    'tx':     ['power', 'maxpower', 'mode', 'micgain', 'wpm', 'cwtone',
-               'sidetone', 'prefix'],
+    'tx':     ['power', 'maxpower', 'mode', 'source', 'hwptt', 'cal', 'shape',
+               'gain', 'micgain', 'latency', 'wpm', 'cwtone', 'sidetone',
+               'prefix'],
     'm':      ['USB', 'LSB', 'AM', 'FM', 'CW', 'CWU', 'CWL'],
     'agc':    ['auto', 'on', 'off', 'fixed:'],
     'sharpness': ['soft', 'normal', 'sharp'],
@@ -766,6 +1040,12 @@ def interactive_loop(rx):
             _tx_command(rx, line[2:].strip()); continue
         if line == 'tune' or line.startswith('tune '):
             _tune_command(rx, line[4:].strip()); continue
+        if line in ('key', 'ptt'):
+            _key_command(rx, True); continue
+        if line in ('unkey', 'unptt'):
+            _key_command(rx, False); continue
+        if line == 'voice':
+            _voice_command(rx); continue
         if line in ('read-config', 'readconfig', 'read_config'):
             _read_config(rx); continue
         if line in ('write-config', 'writeconfig', 'write_config'):
@@ -921,10 +1201,19 @@ def main():
                     help='logging verbosity (default info)')
     ap.add_argument('freq_khz', nargs='?', type=float, default=14074.0)
     ap.add_argument('--mode', default='USB')
-    ap.add_argument('--device', type=int, default=5,
-                    help='audio device (5 = pipewire; 3 = raw ALSA hw)')
-    ap.add_argument('--local-ip', default='10.1.2.185')
-    ap.add_argument('--radio-ip', default='10.1.2.3')
+    ap.add_argument('--device', type=_device_arg, default=5,
+                    help='RX audio output device: a numeric index OR a device-'
+                         'name substring. A NAME is stable across USB hotplug '
+                         '(indices renumber and "pipewire" follows the moving '
+                         'default sink); e.g. --device alsa_output.pci  pins to '
+                         'the onboard analog output no matter what mics you plug '
+                         'in. Default 5.')
+    ap.add_argument('--local-ip', default='',
+                    help='local IP to bind on the radio subnet; default '
+                         'binds all interfaces (set it if you have several)')
+    ap.add_argument('--radio-ip', default=None,
+                    help='radio IP; default None broadcast-discovers the radio '
+                         '(set it, or put radio_ip in config, to skip discovery)')
     ap.add_argument('--variant', default='PRO', choices=['PRO', 'DX'],
                     help='radio model. PRO is hardware-verified; DX is from the '
                          'ArtemisSDR reference and UNVERIFIED (may not work).')
@@ -999,7 +1288,7 @@ def main():
                          'Both receivers share the one wire rate (--rate).')
     ap.add_argument('--rx2-mode', default=None,
                     help='demod mode for RX2 (default: same as --mode)')
-    ap.add_argument('--rx2-device', type=int, default=None,
+    ap.add_argument('--rx2-device', type=_device_arg, default=None,
                     help='audio output device for RX2 (default: IQ/monitor only, '
                          'no audio). Use a second device for dual-watch listening.')
     ap.add_argument('--seconds', type=int, default=None,
@@ -1043,11 +1332,29 @@ def main():
         try:
             from solsdr.audio.audio_bridge import AudioBridge
             from solsdr.audio.rigctld_poller import RigctldPoller
+            # Bridge logs (PTT on/off, mic-audio flow) are useful when
+            # diagnosing TX — surface them at --log-level debug.
             br = AudioBridge(rx.radio, prefix=args.prefix, tx_mode=args.tx_mode,
                                 max_power_watts=args.max_power_watts,
                                 tx_watts=args.tx_watts, monitor_sink=args.monitor,
-                                verbose=False)
+                                verbose=(args.log_level == 'debug'))
             br.start(external_iq=True)          # fed by rx's IQ fan-out
+            # Load persisted per-source audio profiles (gain/shape/calibrated)
+            # + the last TX source, so each mic "just works" at its saved
+            # settings on startup. (These aren't argparse args, so apply the
+            # raw config dict here.)
+            if cfg:
+                if any(k.startswith('tx_src_') for k in cfg):
+                    br.load_source_profiles(cfg)
+                if cfg.get('tx_source'):
+                    br.set_tx_source(str(cfg['tx_source']))
+                if cfg.get('tx_hwptt') in (True, 'true', 'on', '1', 1):
+                    br.set_hw_ptt(True)
+                if cfg.get('tx_latency_ms') is not None:
+                    try:
+                        br.set_feed_ahead(float(cfg['tx_latency_ms']) / 1000.0)
+                    except (ValueError, TypeError):
+                        pass
             rx.bridge = br
             bridge_poller = RigctldPoller(rx.radio, ptt_callback=br.set_ptt,
                                           port=args.hamlib_port)

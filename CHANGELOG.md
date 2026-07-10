@@ -1,9 +1,49 @@
 # Changelog
 
-All notable changes to solsdr. This project is **alpha**; the SunSDR2 **PRO**
-is hardware-verified, the **DX** is not.
+All notable changes to solsdr. Maturity varies: **RX1 + TX (CW/digital/voice)
+are beta** on the SunSDR2 **PRO** (hardware-verified); **RX2 is alpha**; the
+**DX** variant is unverified.
 
 ## Unreleased
+
+- **Voice / SSB is now a first‑class TX source**, hardware‑verified on‑air (PRO,
+  into a dummy load). Three sources via `tx source pc|mic1|mic2`:
+  - **Front‑panel Mic1/Mic2** — the radio digitizes the mic and streams it back
+    to the host as downstream `0xFD` frames (mono in the IQ wrapper); solsdr
+    modulates it and streams TX IQ up. New `packet.decode_tx_audio_packet()`,
+    radio `on_tx_audio` callback + RX‑loop dispatch, wire‑rate mic path. See
+    ARTEMISSDR.md §7.
+  - **PC / USB mic** — audio on the `solsdr-tx` sink (route a mic in with
+    `pactl load-module module-loopback source=<mic> sink=solsdr-tx`).
+- **Hardware / external PTT** (`tx hwptt on`): the radio's external‑PTT input
+  (footswitch, hand‑mic PTT) is decoded from its `0x1F` edge packet
+  (`packet.parse_ptt_edge()`, radio `on_ptt_edge` callback) and keys/unkeys TX
+  alongside CAT PTT. Telemetry parsing now rejects that packet (byte‑2 subtype).
+  See ARTEMISSDR.md §8.
+- **Software / spacebar PTT.** `key`/`unkey` (aliases `ptt`/`unptt`) are explicit
+  software PTT; `voice` is a push‑to‑talk console — **hold SPACE** to talk, **tap
+  ENTER** to toggle a latched hands‑free over, `q`/`Esc` exits.
+- **Per‑source mic calibration + comms voice shaping.** `tx cal [s]` measures
+  your normal speaking level and computes a fixed input gain (mic1/mic2 key the
+  radio to measure — dummy load; pc measures the sink with no RF). `tx shape
+  [src] flat|comms|dx` selects a voice band‑pass + speech‑compression preset
+  (SSB is comms, not hi‑fi). `tx gain [src] <x>` sets a gain by hand. Saved per
+  source in config (`tx_src_<src>_{gain,shape,cal}`) and re‑applied on source
+  switch. The `Modulator` gained shaping presets + a fixed‑gain (leveling‑off)
+  path; a calibrated source uses fixed gain like a real rig, uncalibrated keeps
+  auto‑leveling.
+- **Adjustable voice→RF latency.** `tx latency <ms>` sets the IQ pre‑buffer ahead
+  of the pacer (the dominant voice→RF delay); default lowered from ~800 ms to
+  **120 ms**, live‑tunable and saved as `tx_latency_ms`.
+- **Startup rigctld reaper.** `RigctldPoller.start()` now kills any orphaned
+  `rigctld` already bound to its CAT port before launching its own — a leftover
+  from a crashed/killed solsdr no longer silently shadows the port and breaks
+  CAT (it had made JS8Call unable to change frequency).
+- **Control API `status`** now includes `fwd_power_raw`/`volts`/`amps` from
+  telemetry, so a client can confirm TX remotely.
+- **PipeWire RX output pinning** documented: set `PULSE_SINK=<sink-name>` to keep
+  RX audio on a fixed output when USB mics/headsets hotplug and steal the default
+  sink.
 
 - **Text control API (:5556) is now ON BY DEFAULT** (loopback), matching
   `--iq-server` — the panadapter and other clients read it for live

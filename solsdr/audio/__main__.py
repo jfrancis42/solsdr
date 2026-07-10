@@ -17,8 +17,8 @@ Point your digital-mode app at:
   * PTT method        : CAT (rigctl T command) — the bridge keys TX on PTT.
 
 Example:
-  python3 -m solsdr.audio --radio 10.1.2.3 --local-ip 10.1.2.185
-  python3 -m solsdr.audio --wake --local-ip 10.1.2.185 --prefix solsdr
+  python3 -m solsdr.audio --radio 192.0.2.10 --local-ip 192.0.2.20
+  python3 -m solsdr.audio --wake --local-ip 192.0.2.20 --prefix solsdr
 """
 import argparse
 import signal
@@ -34,11 +34,11 @@ from .rigctld_poller import RigctldPoller
 def main():
     ap = argparse.ArgumentParser(
         description='SunSDR2 <-> PulseAudio bridge for JS8Call/WSJT-X/fldigi.')
-    ap.add_argument('--radio', metavar='IP', help='radio IP (e.g. 10.1.2.3)')
+    ap.add_argument('--radio', metavar='IP', help='radio IP (e.g. 192.0.2.10)')
     ap.add_argument('--wake', action='store_true',
                     help='broadcast-discover the radio instead of --radio')
-    ap.add_argument('--local-ip', default='10.1.2.185',
-                    help='local IP on the radio subnet (default 10.1.2.185)')
+    ap.add_argument('--local-ip', default='',
+                    help='local IP on the radio subnet (default: bind all)')
     ap.add_argument('--variant', default='PRO', choices=['PRO', 'DX'])
     ap.add_argument('--hamlib-port', type=int, default=4532,
                     help='CAT port for the real rigctld JS8Call connects to')

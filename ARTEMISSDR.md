@@ -289,13 +289,76 @@ Mic1 (footswitch), 20 m USB into a dummy load:
     (**I==Q on 0.0%** of pairs) — the host modulator's SSB output, sent verbatim to
     the PA (the raw‑IQ TX path solsdr already implements).
 - `0xFD` frames exist **only** in the keyed window (0 outside it), both directions.
-- **Implication for solsdr:** front‑panel‑mic support is a **receive‑side** job,
-  not a TX one. Read the downstream `0xFD` frames, take I (== Q) as the mono mic
-  sample stream, feed it into the existing `Modulator` in place of the `solsdr‑tx`
-  PulseAudio source. The whole downstream TX‑IQ chain already works. `0x21` selects
-  *which jack the radio digitizes*; ExpertSDR3's "PC" reuses Mic2's wire value
-  (`0x21`=1) and simply ignores the upstream mic stream, modulating soundcard audio
-  instead (see §4a). This mirrors TCI's RX_AUDIO/TX_AUDIO split.
+
+### Downstream mic‑audio frame layout (radio → host, `0xFD`)
+
+Byte‑identical framing to an RX IQ packet, only the opcode differs:
+
+```
+offset  bytes  meaning
+0       1      magic (PRO 0x01)
+1       1      0xFF
+2       1      0xFD   <-- opcode: TX‑active (RX IQ is 0xFE)
+3       1      0xFF
+4..5    2      payload length, little‑endian = 1200
+6..7    2      sequence (uint16 LE)
+8       1      (as in RX IQ headers)
+9       1      (as in RX IQ headers)
+10..1209 1200  200 samples × 6 bytes: 24‑bit LE signed, Q first then I
+```
+
+Decode is the SAME 24‑bit Q‑first unpack as RX IQ — but the payload is a **mono
+audio** signal duplicated into both channels (**I == Q on 100 % of samples**,
+measured). So take EITHER channel as the mono mic sample and normalise by 2²³:
+
+```python
+# pairs: (200, 6) uint8; cols 0..2 = Q, 3..5 = I (identical here)
+i = decode_24le_signed(pairs[:, 3:6]).astype(float32) / 8388608.0   # mono mic
+```
+
+Total 1210‑byte packets, 200 samples each, arriving at the wire rate
+(≈39062.5 Hz for the PRO). ~195 packets/s.
+
+### How to transmit the front‑panel mic — the full loop
+
+It is a **feedback loop on port 50002**, entirely host‑side modulation:
+
+```
+key (footswitch or CAT)                 radio digitizes selected mic
+        │                                        │
+        ▼                                        ▼
+  radio enters TX  ──────────────────▶  radio → host  0xFD  (mono mic audio)
+        ▲                                        │
+        │                                        ▼
+  host → radio  0xFD (complex SSB IQ) ◀── host Modulator (audio→IQ)
+        │
+        ▼
+     PA → RF
+```
+
+Implementation steps (this is what solsdr does):
+
+1. **Select the jack:** send `0x21` = 0 (Mic1) or 1 (Mic2) — §4a. This tells the
+   radio which mic to digitize.
+2. **Key normally:** the verified TX‑entry sequence (§6) — config‑block `0x20`
+   (TX) → drive `0x17` → MOX `0x06`=1 — and STOP echoing the `0xFE` RX keepalive
+   (RX IQ ceases both directions while keyed). No special "mic mode" command; the
+   downstream `0xFD` mic stream just starts once keyed.
+3. **Consume downstream `0xFD`** on 50002, decode to mono audio (above).
+4. **Modulate** that audio (SSB/AM/FM) → complex baseband IQ at the wire rate.
+   Because the mic audio is ALREADY at the wire rate, the modulator's "audio
+   rate" = the wire rate (identity resample — do NOT resample from 48 kHz).
+5. **Send upstream `0xFD`** — the standard TX‑IQ path (the same `0xFD` frames the
+   raw‑IQ TX server / GNU Radio path uses), paced at the 5.12 ms cadence.
+6. **Unkey** with the verified exit sequence (§6); RX IQ resumes.
+
+`0x21` selects *which jack the radio digitizes*; ExpertSDR3's GUI "PC" option
+reuses Mic2's wire value (`0x21`=1) and simply **ignores** the upstream mic
+stream, modulating soundcard audio instead (see §4a). This whole scheme mirrors
+TCI's RX_AUDIO/TX_AUDIO split. The single non‑obvious gotcha for an
+implementer: you must KEY FIRST — the mic audio only flows after MOX‑on — so
+prebuffer zero and let the modulator feed silence until the first mic packet
+arrives (don't block waiting for audio before keying, or you deadlock).
 
 ## 8. External PTT input is reported to the host via a `0x1F` edge packet (verified 2026‑07‑10)
 
@@ -304,23 +367,48 @@ is **readable over the network** — the host does not poll for it; the radio pu
 an unsolicited status packet on each edge. Verified by pressing a footswitch wired
 to the radio (no mic audio) and watching 50002:
 
-- **Packet:** `01 ff 1f 01 …`, **64 bytes**, radio → host on port 50002. Note it is
-  a **different subtype from the streaming telemetry**: the continuous `0x1F`
-  telemetry (V/A/temp/fwd‑power, §3) has **byte 3 = `0x00`** and is **76 bytes**;
-  this PTT‑edge packet has **byte 3 = `0x01`** and is **64 bytes**. Same opcode,
-  distinct length + subtype byte.
-- **PTT state is at payload offset 18:** `…0001000000` = **pressed**,
-  `…0000000000` = **released**. Sent once per transition (not continuously).
-- **Timing (why ExpertSDR3 keys off it):** the radio's `0x1F 01` *press* packet
-  arrives **3–13 ms BEFORE** the host's own key command (`0x18`→`0x20`→`0x06`).
-  Measured across four presses: press→host‑key gaps of 13, 9, 8, 3 ms. The host
-  reads this packet, then decides to key. There is **no polling opcode** — the host
-  only ever sends `0x18/0x20/0x06`; the radio initiates.
-- **Implication for solsdr:** external‑PTT support is decoding one more inbound
-  packet type solsdr already receives on 50002 — dispatch `0x1F`/64‑byte/byte3=`01`
-  to a PTT‑edge handler reading offset 18, and drive `set_ptt`/`TXSession` from it
-  (a hardware PTT source alongside CAT PTT). Distinguish it from the 76‑byte
-  telemetry by length + byte 3.
+**Packet header — how to tell it from supply telemetry.** Both this PTT‑edge
+packet and the streaming supply telemetry (§3) carry opcode `0x1F` at **byte 3**.
+They are distinguished by **byte 2** (call it the subtype):
+
+```
+byte:   0     1     2     3     ...
+        magic 0xFF  SUB   0x1F  ...
+                    ^^^
+  supply telemetry: SUB = 0x00   (V/A/temp/fwd‑power, §3)
+  external‑PTT edge: SUB = 0x01   (this packet)
+```
+
+They also differ in size (telemetry's UDP payload is larger), but **byte 2 is the
+reliable discriminator** — match `magic, 0xFF, 0x01, 0x1F` for the PTT edge and
+`magic, 0xFF, 0x00, 0x1F` for telemetry. (Earlier notes cited "64 vs 76 bytes";
+those were tshark on‑wire frame lengths including Ethernet/IP/UDP headers — the
+subtype byte is what you actually test in a decoder.)
+
+- **PTT state is a byte at payload offset 18:** `0x01` = **pressed** (key down),
+  `0x00` = **released** (key up). Sent once per transition, not continuously.
+- **Timing (why ExpertSDR3 keys off it):** the radio's *press* packet arrives
+  **3–13 ms BEFORE** the host's own key command (`0x18`→`0x20`→`0x06`). Measured
+  across four presses: press→host‑key gaps of 13, 9, 8, 3 ms. The host reads this
+  packet, then decides to key. There is **no polling opcode** — the host only ever
+  sends `0x18/0x20/0x06`; the radio initiates.
+
+### How to implement external PTT
+
+Trivial once you're already reading 50002:
+
+1. In the RX loop, before falling through to telemetry, test each non‑IQ packet
+   for the PTT‑edge header (`byte2==0x01 && byte3==0x1F`). Read the state byte at
+   offset 18 → pressed/released.
+2. On a **pressed** edge, run your normal key sequence (§6); on **released**,
+   unkey. This is a hardware‑PTT source that sits alongside CAT PTT — either can
+   key. (solsdr gates it behind an opt‑in flag so a stray footswitch can't
+   transmit unless enabled.)
+3. Keying does blocking control‑socket I/O, so dispatch it off the RX loop (a
+   short‑lived thread) — never stall the loop that must keep echoing keepalives.
+
+Also make sure the telemetry parser rejects the PTT‑edge packet (require
+byte 2 == 0x00) so a key press isn't misread as a voltage/current reading.
 
 ---
 

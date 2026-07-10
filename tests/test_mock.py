@@ -23,7 +23,7 @@ c.settimeout(2)
 c.sendto(pk.build_discovery_probe(0x01), ('127.0.0.1', CONTROL_PORT))
 reply,_ = c.recvfrom(1024)
 parsed = pk.parse_discovery_reply(reply)
-assert parsed == ('10.1.2.3', 50001), f"discovery parse {parsed}"
+assert parsed == ('192.0.2.3', 50001), f"discovery parse {parsed}"
 print("✓ discovery: radio replied", parsed)
 
 # 2. Control ACK (keepalive)
