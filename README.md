@@ -106,8 +106,8 @@ on‑air by JS8Call through the audio bridge. See **Transmit** below.
 | Supply telemetry: voltage / current / temperature / forward‑power | ✅ `0x1F` fully decoded; shown in status (V/A, °F). Includes a forward‑power field (`fwd_power_raw`). No SWR is reported by the radio. Temperature is read‑only — the radio runs its own fan in firmware (no host setpoint) |
 | Front-end: HF.LPF, VHF.LNA toggles | ✅ opcodes verified (relay‑confirmed); `lpf`/`lna` shell cmds |
 | Mic source (Mic1/Mic2/PC) | ✅ verified (`0x21`); `mic` shell cmd. Mic gain is client‑side (no radio cmd) |
-| Front‑panel mic (Mic1/Mic2 jack) → on‑air voice | ⛔ **not supported.** solsdr transmits **host‑generated IQ**, not the radio's internal analog modulator. The front‑panel mic feeds the radio's own modulator, which solsdr bypasses — a mic in Mic1/Mic2 is not in the TX path. To talk, feed a **PC** mic into the `solsdr-tx` sink (see "Voice / SSB from a PC mic"). Would require new firmware‑modulation support that isn't reverse‑engineered (see TODO). |
-| Radio's external/hardware PTT input line | ⛔ **not supported / TODO: test.** solsdr keys via CAT only (`0x06` MOX over UDP). Nothing in the code reads the radio's external‑PTT input, and it's unknown whether the radio even reports that line's state to the host over the wire — untested. There is **no VOX** either. |
+| Front‑panel mic (Mic1/Mic2 jack) → on‑air voice | 🔬 **protocol verified, not yet implemented.** The radio digitizes the mic and streams it **up to the host** as `0xFD` frames (mono, in the IQ wrapper); the host modulates and streams TX IQ back down. Supporting it means reading that upstream mic audio into solsdr's `Modulator` — a receive‑side decode, not new TX. Until then, use a **PC** mic into the `solsdr-tx` sink (see "Voice / SSB from a PC mic"). See ARTEMISSDR.md §7. |
+| Radio's external/hardware PTT input (footswitch) | 🔬 **protocol verified, not yet implemented.** The radio pushes a `0x1F`/64‑byte edge packet (radio→host, :50002) on every external‑PTT transition — PTT state at payload offset 18 (`01`=pressed). solsdr can key from it alongside CAT PTT once decoded. See ARTEMISSDR.md §8. (No VOX.) |
 | USB / LSB / AM / FM / CW demodulation + S‑meter | ✅ verified |
 | CW receive: BFO demod + Morse decoder | ✅ verified (synthetic full‑chain) |
 | Automatic reconnection on network loss | ✅ verified (simulated interruption) |
@@ -142,16 +142,15 @@ on‑air by JS8Call through the audio bridge. See **Transmit** below.
   responsibly and legally.
 - **VHF** — largely untested; deliberately never keyed during TX calibration.
 - **SunSDR2 DX** — profile is coded from ArtemisSDR but unverified on hardware.
-- **Front‑panel mic + hardware/external PTT** — NOT supported and only partly
-  investigated. solsdr's TX is host‑generated IQ streamed over UDP; the analog
-  Mic1/Mic2 jacks feed the radio's *internal* modulator, which this project
-  bypasses, and PTT is CAT‑only (`0x06` MOX). Making the front‑panel mic key and
-  modulate on its own would require the radio to run its internal modulator on a
-  host command and to report its external‑PTT input state to the host — neither
-  path is reverse‑engineered. **TODO: capture ExpertSDR3** keying from the
-  front‑panel mic + external PTT to learn whether the radio (a) modulates
-  internally when told to and (b) sends a host‑visible PTT‑input status
-  bit/packet. Until then, transmit with a **PC mic into `solsdr-tx`** (below).
+- **Front‑panel mic + hardware/external PTT — protocol reverse‑engineered
+  (2026‑07‑10), implementation pending.** Both are supportable; the wire behavior
+  is now known (see ARTEMISSDR.md §7–§8). The front‑panel mic is digitized and
+  streamed **up** to the host as `0xFD` frames (mono in the IQ wrapper) for the
+  host to modulate — so it's a receive‑side decode into the existing `Modulator`,
+  not new TX. The external PTT input is reported by a `0x1F`/64‑byte edge packet
+  (radio→host, PTT state at payload offset 18) that solsdr can key from alongside
+  CAT PTT. Not yet wired into solsdr. Meanwhile, transmit voice with a **PC mic
+  into `solsdr-tx`** (below).
 - **CW receive decode → shell** — the RX Morse decoder exists but decoded text
   isn't yet surfaced in the transceiver shell (planned). CW *transmit* is done
   (`cw <text>`).
