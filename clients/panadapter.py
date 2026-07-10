@@ -335,14 +335,34 @@ class IQReader(_RingReader):
                 self.connected = False
 
     def _pump(self, sock):
+        # Drain-to-live reader. The IQ server pushes ~39k samples/s continuously;
+        # if this client ever falls behind (a GC pause, a slow repaint), the
+        # unread bytes pile up in the TCP buffers and — because we only need the
+        # NEWEST samples for the display — that backlog would otherwise grow
+        # without bound, so the waterfall/FFT would drift seconds behind live and
+        # get worse the longer the panadapter runs. After each blocking recv we
+        # greedily pull everything else already waiting (non-blocking) in one
+        # batch, so we always process the freshest IQ and never accumulate lag.
         leftover = b""
         while self._running:
             try:
-                data = sock.recv(65536)
+                data = sock.recv(1 << 20)
             except OSError:
                 break
             if not data:
                 break
+            # non-blocking drain of any further buffered data this instant
+            sock.setblocking(False)
+            try:
+                while True:
+                    more = sock.recv(1 << 20)
+                    if not more:
+                        break
+                    data += more
+            except (BlockingIOError, OSError):
+                pass
+            finally:
+                sock.setblocking(True)
             data = leftover + data
             n = len(data) - (len(data) % 8)          # whole complex64 only
             leftover = data[n:]

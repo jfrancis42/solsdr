@@ -87,6 +87,9 @@ class IQStreamServer:
             try:
                 conn.sendall(header)
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                # Non-blocking so a slow/backed-up client can NEVER block the
+                # radio RX loop (publish() runs there — see the note below).
+                conn.setblocking(False)
             except OSError:
                 conn.close()
                 continue
@@ -95,7 +98,16 @@ class IQStreamServer:
             self._log(f'client connected {addr} ({len(self._clients)} total)')
 
     def publish(self, iq: np.ndarray):
-        """Radio stream callback: broadcast one IQ block to all clients."""
+        """Radio stream callback: broadcast one IQ block to all clients.
+
+        CRITICAL: this runs synchronously in the radio's RX loop — the same
+        thread that demods audio and echoes keepalives. It MUST NOT block. If a
+        client can't keep up (its TCP send buffer is full), we DROP this block
+        for that client rather than block the loop. A previous blocking sendall
+        let a backed-up client (e.g. a panadapter that had drifted seconds
+        behind over a long run) back-pressure the whole loop, delaying audio and
+        the FFT/waterfall in lockstep. Dropping keeps the live path live; the
+        client's own drain-to-live read recovers cleanly from the gap."""
         if not self._clients:
             return
         data = np.ascontiguousarray(iq, dtype=np.complex64).tobytes()
@@ -103,7 +115,11 @@ class IQStreamServer:
         with self._clients_lock:
             for c in self._clients:
                 try:
-                    c.sendall(data)
+                    # one non-blocking send; partial/would-block -> drop the rest
+                    # of THIS block for this client (don't spin, don't buffer).
+                    c.send(data)
+                except (BlockingIOError, InterruptedError):
+                    pass                      # buffer full — drop this block
                 except OSError:
                     dead.append(c)
             for c in dead:

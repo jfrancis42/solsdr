@@ -267,9 +267,16 @@ class AudioReceiver:
         # Back-compat: setting rx.iq_sink targets RX1's channel.
         self.channels[0].iq_sink = fn
 
+    # Audio output buffer latency (seconds). 'high' (the old value) asks the
+    # backend for its largest safe buffer — on PipeWire that can be a second or
+    # more, so a retune plays out that much STALE (old-frequency) audio before
+    # the new frequency is heard. A fixed, modest buffer keeps retunes feeling
+    # instant while staying large enough to avoid underruns on a loaded box.
+    AUDIO_LATENCY_S = 0.1
+
     def _open_stream(self, device):
         s = sd.OutputStream(samplerate=AUDIO_RATE, channels=1, dtype='float32',
-                            device=device, latency='high')
+                            device=device, latency=self.AUDIO_LATENCY_S)
         s.start()
         return s
 
